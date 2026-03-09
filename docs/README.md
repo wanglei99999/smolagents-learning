@@ -15,10 +15,15 @@ limitations under the License.
 -->
 
 # Generating the documentation
+# 生成文档
 
 To generate the documentation, you have to build it. Several packages are necessary to build the doc.
 
+要生成文档，你需要先构建它。构建文档需要安装几个包。
+
 First, you need to install the project itself by running the following command at the root of the code repository:
+
+首先，你需要在代码仓库的根目录运行以下命令来安装项目本身：
 
 ```bash
 pip install -e .
@@ -26,23 +31,30 @@ pip install -e .
 
 You also need to install 2 extra packages:
 
+你还需要安装 2 个额外的包：
+
 ```bash
 # `hf-doc-builder` to build the docs
 pip install git+https://github.com/huggingface/doc-builder@main
 ```
 
 ---
-**NOTE**
+**NOTE** / **注意**
 
 You only need to generate the documentation to inspect it locally (if you're planning changes and want to
 check how they look before committing for instance). You don't have to commit the built documentation.
 
+你只需要在本地检查文档时生成它（例如，如果你计划做更改并想在提交前查看效果）。你不需要提交已构建的文档。
+
 ---
 
 ## Building the documentation
+## 构建文档
 
 Once you have setup the `doc-builder` and additional packages with the pip install command above,
 you can generate the documentation by typing the following command:
+
+一旦你使用上面的 pip install 命令设置好 `doc-builder` 和其他包后，你可以通过输入以下命令来生成文档：
 
 ```bash
 doc-builder build smolagents docs/source/en/ --build_dir ~/tmp/test-build
@@ -52,9 +64,14 @@ You can adapt the `--build_dir` to set any temporary folder that you prefer. Thi
 the MDX files that will be rendered as the documentation on the main website. You can inspect them in your favorite
 Markdown editor.
 
+你可以修改 `--build_dir` 来设置任何你喜欢的临时文件夹。这个命令会创建该文件夹并生成 MDX 文件，这些文件将在主网站上渲染为文档。你可以在你喜欢的 Markdown 编辑器中查看它们。
+
 ## Previewing the documentation
+## 预览文档
 
 To preview the docs, run the following command:
+
+要预览文档，运行以下命令：
 
 ```bash
 doc-builder preview smolagents docs/source/en/
@@ -63,26 +80,40 @@ doc-builder preview smolagents docs/source/en/
 The docs will be viewable at [http://localhost:5173](http://localhost:5173). You can also preview the docs once you
 have opened a PR. You will see a bot add a comment to a link where the documentation with your changes lives.
 
+文档将在 [http://localhost:5173](http://localhost:5173) 上可见。一旦你打开了 PR，你也可以预览文档。你会看到一个机器人添加评论，其中包含你的更改后的文档链接。
+
 ---
-**NOTE**
+**NOTE** / **注意**
 
 The `preview` command only works with existing doc files. When you add a completely new file, you need to update
 `_toctree.yml` & restart `preview` command (`ctrl-c` to stop it & call `doc-builder preview ...` again).
 
+`preview` 命令只适用于现有的文档文件。当你添加一个全新的文件时，你需要更新 `_toctree.yml` 并重启 `preview` 命令（按 `ctrl-c` 停止它，然后再次调用 `doc-builder preview ...`）。
+
 ---
 
 ## Adding a new element to the navigation bar
+## 向导航栏添加新元素
 
 Accepted files are Markdown (.md).
+
+接受的文件格式是 Markdown (.md)。
 
 Create a file with its extension and put it in the source directory. You can then link it to the toc-tree by putting
 the filename without the extension in the [`_toctree.yml`](https://github.com/huggingface/smolagents/blob/main/docs/source/_toctree.yml) file.
 
+创建一个带扩展名的文件并将其放在 source 目录中。然后你可以通过在 [`_toctree.yml`](https://github.com/huggingface/smolagents/blob/main/docs/source/_toctree.yml) 文件中添加不带扩展名的文件名来将其链接到目录树。
+
 ## Renaming section headers and moving sections
+## 重命名章节标题和移动章节
 
 It helps to keep the old links working when renaming the section header and/or moving sections from one document to another. This is because the old links are likely to be used in Issues, Forums, and Social media and it'd make for a much more superior user experience if users reading those months later could still easily navigate to the originally intended information.
 
+在重命名章节标题和/或将章节从一个文档移动到另一个文档时，保持旧链接有效是很有帮助的。这是因为旧链接可能会在 Issues、论坛和社交媒体中使用，如果几个月后阅读这些内容的用户仍然可以轻松导航到最初预期的信息，这将带来更好的用户体验。
+
 Therefore, we simply keep a little map of moved sections at the end of the document where the original section was. The key is to preserve the original anchor.
+
+因此，我们只需在原始章节所在文档的末尾保留一个移动章节的小地图。关键是保留原始锚点。
 
 So if you renamed a section from: "Section A" to "Section B", then you can add at the end of the file:
 
@@ -105,41 +136,63 @@ For an example of a rich moved section set please see the very end of [the trans
 
 
 ## Writing Documentation - Specification
+## 编写文档 - 规范
 
 The `huggingface/smolagents` documentation follows the
 [Google documentation](https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html) style for docstrings,
 although we can write them directly in Markdown.
 
+`huggingface/smolagents` 文档遵循 [Google 文档](https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html) 风格的 docstring，尽管我们可以直接用 Markdown 编写它们。
+
 ### Adding a new tutorial
+### 添加新教程
 
 Adding a new tutorial or section is done in two steps:
 
+添加新教程或章节分两步完成：
+
 - Add a new Markdown (.md) file under `./source`.
+- 在 `./source` 下添加一个新的 Markdown (.md) 文件。
 - Link that file in `./source/_toctree.yml` on the correct toc-tree.
+- 在 `./source/_toctree.yml` 的正确目录树中链接该文件。
 
 Make sure to put your new file under the proper section. If you have a doubt, feel free to ask in a Github Issue or PR.
 
+确保将新文件放在正确的章节下。如果有疑问，请随时在 Github Issue 或 PR 中提问。
+
 ### Writing source documentation
+### 编写源代码文档
 
 Values that should be put in `code` should either be surrounded by backticks: \`like so\`. Note that argument names
 and objects like True, None, or any strings should usually be put in `code`.
 
+应该放在 `code` 中的值应该用反引号包围：\`像这样\`。注意参数名和对象（如 True、None 或任何字符串）通常应该放在 `code` 中。
+
 When mentioning a class, function, or method, it is recommended to use our syntax for internal links so that our tool
 adds a link to its documentation with this syntax: \[\`XXXClass\`\] or \[\`function\`\]. This requires the class or
 function to be in the main package.
+
+当提到类、函数或方法时，建议使用我们的内部链接语法，这样我们的工具会用这种语法添加到其文档的链接：\[\`XXXClass\`\] 或 \[\`function\`\]。这要求类或函数在主包中。
 
 If you want to create a link to some internal class or function, you need to
 provide its path. For instance: \[\`utils.ModelOutput\`\]. This will be converted into a link with
 `utils.ModelOutput` in the description. To get rid of the path and only keep the name of the object you are
 linking to in the description, add a ~: \[\`~utils.ModelOutput\`\] will generate a link with `ModelOutput` in the description.
 
+如果你想创建到某个内部类或函数的链接，你需要提供其路径。例如：\[\`utils.ModelOutput\`\]。这将被转换为描述中带有 `utils.ModelOutput` 的链接。要去掉路径并只在描述中保留你链接到的对象名称，添加一个 ~：\[\`~utils.ModelOutput\`\] 将生成描述中带有 `ModelOutput` 的链接。
+
 The same works for methods so you can either use \[\`XXXClass.method\`\] or \[~\`XXXClass.method\`\].
 
+方法也是如此，所以你可以使用 \[\`XXXClass.method\`\] 或 \[~\`XXXClass.method\`\]。
+
 #### Defining arguments in a method
+#### 定义方法中的参数
 
 Arguments should be defined with the `Args:` (or `Arguments:` or `Parameters:`) prefix, followed by a line return and
 an indentation. The argument should be followed by its type, with its shape if it is a tensor, a colon, and its
 description:
+
+参数应该用 `Args:`（或 `Arguments:` 或 `Parameters:`）前缀定义，后跟换行和缩进。参数后面应该跟着它的类型，如果是张量则包括其形状，一个冒号，以及它的描述：
 
 ```
     Args:
@@ -148,6 +201,8 @@ description:
 
 If the description is too long to fit in one line, another indentation is necessary before writing the description
 after the argument.
+
+如果描述太长无法放在一行中，在参数后编写描述之前需要另一个缩进。
 
 Here's an example showcasing everything so far:
 
@@ -197,10 +252,13 @@ Multi-line code blocks can be useful for displaying examples. They are done betw
 ````
 
 #### Writing a return block
+#### 编写返回值块
 
 The return block should be introduced with the `Returns:` prefix, followed by a line return and an indentation.
 The first line should be the type of the return, followed by a line return. No need to indent further for the elements
 building the return.
+
+返回值块应该用 `Returns:` 前缀引入，后跟换行和缩进。第一行应该是返回值的类型，后跟换行。构成返回值的元素不需要进一步缩进。
 
 Here's an example of a single value return:
 
@@ -221,6 +279,7 @@ Here's an example of a tuple return, comprising several objects:
 ```
 
 #### Adding an image
+#### 添加图片
 
 Due to the rapidly growing repository, it is important to make sure that no files that would significantly weigh down the repository are added. This includes images, videos, and other non-text files. We prefer to leverage a hf.co hosted `dataset` like
 the ones hosted on [`hf-internal-testing`](https://huggingface.co/hf-internal-testing) in which to place these files and reference
@@ -228,9 +287,14 @@ them by URL. We recommend putting them in the following dataset: [huggingface/do
 If an external contribution, feel free to add the images to your PR and ask a Hugging Face member to migrate your images
 to this dataset.
 
+由于仓库快速增长，重要的是确保不添加会显著增加仓库大小的文件。这包括图片、视频和其他非文本文件。我们更倾向于利用 hf.co 托管的 `dataset`（如托管在 [`hf-internal-testing`](https://huggingface.co/hf-internal-testing) 上的那些）来放置这些文件并通过 URL 引用它们。我们建议将它们放在以下数据集中：[huggingface/documentation-images](https://huggingface.co/datasets/huggingface/documentation-images)。如果是外部贡献，请随意将图片添加到你的 PR 中，并请 Hugging Face 成员将你的图片迁移到此数据集。
+
 #### Writing documentation examples
+#### 编写文档示例
 
 The syntax for Example docstrings can look as follows:
+
+示例 docstring 的语法可以如下所示：
 
 ```
     Example:
@@ -266,4 +330,6 @@ output.
 Often, readers will try out the example before even going through the function
 or class definitions. Therefore, it is of utmost importance that the example
 works as expected.
+
+docstring 应该给出一个最小的、清晰的示例，说明如何在推理中使用相应的模型，并包括预期的（理想情况下是合理的）输出。通常，读者会在查看函数或类定义之前尝试示例。因此，示例按预期工作是至关重要的。
 
