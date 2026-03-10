@@ -11,6 +11,49 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# =============================================================================
+# models.py —— 模型适配层（LLM 接入接口）
+#
+# smolagents 通过统一的 Model 抽象基类对接不同的 LLM 后端，
+# 所有模型实现类都继承自 Model，并实现 generate() 方法。
+#
+# 内置模型类（每种对应一种接入方式）：
+#
+#   InferenceClientModel  ←→  HuggingFace Inference API（推荐入门）
+#       - 直接调用 HF Hub 上托管的模型
+#       - 需要 HF token（免费或 PRO）
+#       - 示例：InferenceClientModel(model_id="Qwen/Qwen2.5-72B-Instruct")
+#
+#   LiteLLMModel  ←→  多后端（OpenAI、Anthropic、Ollama、Together AI 等）
+#       - 底层依赖 litellm 库，支持 100+ 个 LLM 提供商
+#       - 示例：LiteLLMModel(model_id="gpt-4o")
+#               LiteLLMModel(model_id="ollama_chat/llama3")
+#
+#   LiteLLMRouterModel  ←→  多模型负载均衡
+#       - 在多个 LLM 之间按策略（轮询、最少繁忙等）路由请求
+#       - 适合高并发或多模型 A/B 测试场景
+#
+#   OpenAIServerModel  ←→  兼容 OpenAI API 协议的模型服务
+#       - 可对接 vLLM、Ollama 等本地服务或第三方 API
+#       - 示例：OpenAIServerModel(model_id="...", api_base="http://localhost:8000/v1")
+#
+#   TransformersModel  ←→  本地 HuggingFace transformers 模型
+#       - 在本地 GPU/CPU 上运行模型，无需网络
+#       - 推理速度取决于本地硬件
+#
+#   AzureOpenAIServerModel  ←→  Azure OpenAI 服务
+#
+#   VLLMModel  ←→  vLLM 高性能推理服务
+#
+# 核心数据结构（消息流转）：
+#   ChatMessage → Model.generate() → ChatMessage（含 tool_calls / content）
+#   MessageRole：USER / ASSISTANT / SYSTEM / TOOL_CALL / TOOL_RESPONSE
+#
+# 重试机制：
+#   默认对 API 调用失败进行最多 3 次重试，等待 60 秒，指数退避
+# =============================================================================
+
 import json
 import logging
 import os
@@ -35,11 +78,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-RETRY_WAIT = 60
-RETRY_MAX_ATTEMPTS = 3
-RETRY_EXPONENTIAL_BASE = 2
-RETRY_JITTER = True
+# API 重试配置：网络抖动或限流时自动重试
+RETRY_WAIT = 60              # 首次重试前等待 60 秒
+RETRY_MAX_ATTEMPTS = 3       # 最多重试 3 次
+RETRY_EXPONENTIAL_BASE = 2   # 指数退避基数（下次等待 = 等待时间 * 2）
+RETRY_JITTER = True          # 添加随机抖动，避免多实例同时重试导致雪崩
+
+# 支持结构化生成（JSON Schema 约束输出）的推理提供商列表
 STRUCTURED_GENERATION_PROVIDERS = ["cerebras", "fireworks-ai"]
+
+# CodeAgent 使用结构化输出模式时的 JSON Schema 约束
+# LLM 必须严格输出 {"thought": "...", "code": "..."} 格式
 CODEAGENT_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
@@ -91,24 +140,36 @@ def remove_content_after_stop_sequences(content: str | None, stop_sequences: lis
     return content
 
 
+# -----------------------------------------------------------------------------
+# 消息数据结构：Agent ↔ LLM 之间的消息格式定义
+# -----------------------------------------------------------------------------
+
 @dataclass
 class ChatMessageToolCallFunction:
-    arguments: Any
-    name: str
+    """工具调用中的函数部分（函数名 + 参数）。"""
+    arguments: Any   # dict 或 JSON 字符串（取决于模型返回格式）
+    name: str        # 工具名称（必须与注册的工具名一致）
     description: str | None = None
 
 
 @dataclass
 class ChatMessageToolCall:
+    """LLM 发出的单次工具调用请求（一次 LLM 输出可能包含多个）。
+    id：工具调用 ID，在多个并行工具调用时用于关联请求和结果
+    """
     function: ChatMessageToolCallFunction
     id: str
-    type: str
+    type: str  # 固定为 "function"
 
     def __str__(self) -> str:
         return f"Call: {self.id}: Calling {str(self.function.name)} with arguments: {str(self.function.arguments)}"
 
 
 class MessageRole(str, Enum):
+    """消息角色枚举。
+    TOOL_CALL：LLM 发出工具调用请求（对应 ToolCallingAgent 的 assistant 消息中含 tool_calls）
+    TOOL_RESPONSE：工具调用结果（框架将执行结果写回历史的角色）
+    """
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
@@ -279,6 +340,10 @@ def agglomerate_stream_deltas(
     )
 
 
+# 角色转换映射：将 smolagents 内部角色名转换为标准 OpenAI 角色名
+# 原因：大多数 LLM API 只支持 user/assistant/system 三种角色
+# TOOL_CALL → ASSISTANT（工具调用是 LLM 发出的，属于 assistant 的行为）
+# TOOL_RESPONSE → USER（工具结果从"外部"传回，属于 user 角色）
 tool_role_conversions = {
     MessageRole.TOOL_CALL: MessageRole.ASSISTANT,
     MessageRole.TOOL_RESPONSE: MessageRole.USER,
@@ -335,7 +400,9 @@ def get_clean_message_list(
     convert_images_to_image_urls: bool = False,
     flatten_messages_as_text: bool = False,
 ) -> list[dict[str, Any]]:
-    """
+    """将 Agent 内部的 ChatMessage 列表转换为 LLM API 可接受的 dict 格式。
+    关键行为：相邻的同角色消息会被合并（避免某些模型不支持连续同角色消息的限制）。
+
     Creates a list of messages to give as input to the LLM. These messages are dictionaries and chat template compatible with transformers LLM chat template.
     Subsequent messages with the same role will be concatenated to a single message.
 

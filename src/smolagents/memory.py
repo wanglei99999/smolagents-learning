@@ -1,3 +1,38 @@
+# =============================================================================
+# memory.py —— Agent 记忆系统
+#
+# 本文件定义了 smolagents 的记忆模型，即 Agent 在 ReAct 循环中如何记录每一步的状态。
+#
+# 核心概念：
+#   AgentMemory 是 Agent 的"对话历史 + 执行日志"合体，
+#   每一步执行完后，Agent 将对应的 MemoryStep 追加到 memory.steps 中。
+#   下一步调用 LLM 时，memory.write_memory_to_messages() 将所有步骤序列化为消息列表，
+#   作为 LLM 的上下文输入（这就是 Agent 能"记住"之前做了什么的原因）。
+#
+# 记忆步骤类型（MemoryStep 的子类）：
+#
+#   SystemPromptStep  ← 系统提示词（每次 run 开始时设置，不重复追加）
+#   TaskStep          ← 用户任务描述（一次 run 只有一个）
+#   PlanningStep      ← 规划步骤（planning_interval 触发时生成，包含计划文本）
+#   ActionStep        ← 行动步骤（ReAct 循环中最核心的步骤，每步一个）
+#       - model_input_messages: 本步 LLM 收到的消息列表（完整上下文）
+#       - model_output: LLM 的原始输出文本（思考 + 行动代码 / 工具调用）
+#       - code_action: 解析出的代码（CodeAgent 专用）
+#       - tool_calls: 工具调用列表（ToolCallingAgent 专用）
+#       - observations: 执行结果 / 工具输出（写回历史供 LLM 下步参考）
+#       - error: 执行错误（若有，LLM 下步会尝试修正）
+#       - token_usage: 本步消耗的 Token 数
+#   FinalAnswerStep   ← 最终答案（循环结束时生成，不写入对话历史）
+#
+# 序列化（summary_mode）：
+#   summary_mode=True 时，ActionStep.to_messages() 会省略 model_output（减少 token 消耗）
+#   summary_mode=True 时，PlanningStep.to_messages() 返回空列表（避免旧计划干扰新计划）
+#   summary_mode=True 时，SystemPromptStep.to_messages() 返回空列表
+#
+# CallbackRegistry：
+#   管理步骤回调函数（step_callbacks），每步完成后按类型触发对应的回调。
+# =============================================================================
+
 import inspect
 from dataclasses import asdict, dataclass
 from logging import getLogger
@@ -23,9 +58,14 @@ logger = getLogger(__name__)
 
 @dataclass
 class ToolCall:
-    name: str
-    arguments: Any
-    id: str
+    """记录 Agent 执行的一次工具调用请求（记忆中的持久化版本）。
+    与 models.py 中的 ChatMessageToolCall 的区别：
+      - ChatMessageToolCall 是 LLM API 返回的原始格式（用于 API 交互）
+      - memory.ToolCall 是写入记忆的序列化版本（用于记录和回放）
+    """
+    name: str      # 工具名称
+    arguments: Any # 工具参数（dict）
+    id: str        # 唯一 ID，用于关联 ToolCallingAgent 的并行调用
 
     def dict(self):
         return {
@@ -49,6 +89,19 @@ class MemoryStep:
 
 @dataclass
 class ActionStep(MemoryStep):
+    """一步完整的 ReAct 行动记录（记忆中最核心的步骤类型）。
+    字段说明：
+      step_number: 步骤编号（从 1 开始）
+      model_input_messages: 本步发给 LLM 的完整消息列表（包含历史）
+      model_output: LLM 的原始输出（含思考和行动描述）
+      code_action: 从 model_output 解析出的 Python 代码（CodeAgent 专用）
+      tool_calls: 解析出的工具调用列表（ToolCallingAgent 专用）
+      observations: 代码/工具执行后的输出结果字符串（写入下一步的上下文）
+      observations_images: 多模态输入的图像（每步都会传入）
+      action_output: 代码执行的 Python 返回值（未序列化的原始对象）
+      error: 执行错误（LLM 下一步会看到错误并尝试修正）
+      is_final_answer: 是否是最后一步（调用了 final_answer 工具/函数）
+    """
     step_number: int
     timing: Timing
     model_input_messages: list[ChatMessage] | None = None
@@ -90,6 +143,11 @@ class ActionStep(MemoryStep):
         }
 
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+        """将此步骤序列化为消息列表，供下一步 LLM 调用使用。
+        summary_mode=True：省略 model_output（减少 token），仅保留工具调用和观察结果，
+                           用于 planning_interval 触发规划时的历史摘要。
+        summary_mode=False：完整输出，用于常规下一步的上下文。
+        """
         messages = []
         if self.model_output is not None and not summary_mode:
             messages.append(
@@ -152,6 +210,11 @@ class ActionStep(MemoryStep):
 
 @dataclass
 class PlanningStep(MemoryStep):
+    """规划步骤记录（planning_interval 触发时生成）。
+    plan: LLM 生成的计划文本（格式："Here are the facts I know and the plan..."）
+    注意：to_messages(summary_mode=True) 返回空列表，
+    这样在生成新计划时不会受旧计划影响（避免路径依赖）。
+    """
     model_input_messages: list[ChatMessage]
     model_output_message: ChatMessage
     plan: str

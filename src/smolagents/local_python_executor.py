@@ -14,6 +14,54 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# =============================================================================
+# local_python_executor.py —— CodeAgent 的本地 Python 沙箱执行器
+#
+# 这是 smolagents 安全执行 LLM 生成代码的核心模块。
+# 不同于直接 exec()，本文件实现了一个基于 AST 的受限 Python 解释器，
+# 能够在不启动任何子进程的情况下，在当前进程内安全执行受限代码。
+#
+# 安全机制（多层防护）：
+#
+#   1. 导入白名单（authorized_imports）
+#      - 只有在白名单中的模块才能被 import
+#      - 默认白名单：BASE_BUILTIN_MODULES（collections, json, math, datetime 等）
+#      - 用户通过 additional_authorized_imports 扩展
+#      - additional_authorized_imports=["*"] 则允许所有导入（危险！生产环境禁用）
+#
+#   2. 危险模块黑名单（DANGEROUS_MODULES）
+#      - os, sys, subprocess, socket, pathlib 等文件系统/网络/进程相关模块被禁止
+#
+#   3. Dunder 方法限制（ALLOWED_DUNDER_METHODS）
+#      - 只允许 __init__, __str__, __repr__
+#      - 防止通过 __class__.__bases__ 等方式逃逸沙箱
+#
+#   4. 操作计数器（MAX_OPERATIONS = 10,000,000）
+#      - 限制总操作数，防止无限循环消耗资源
+#
+#   5. 执行超时（MAX_EXECUTION_TIME_SECONDS = 30）
+#      - 使用线程池实现超时（兼容 Windows 和非主线程调用，不依赖 signal）
+#      - 超时后抛出 ExecutionTimeoutError
+#
+#   6. print 重定向
+#      - 代码中的 print() 输出被重定向到 PrintContainer
+#      - 不会真正打印到终端，而是收集到 logs 中返回给 Agent
+#
+# 核心执行流程（evaluate_python_code → LocalPythonExecutor.__call__）：
+#   代码字符串 → ast.parse() → 逐节点 evaluate_ast() → 返回 CodeOutput
+#
+# final_answer 的特殊处理：
+#   - 当代码调用 final_answer(xxx) 时，抛出 FinalAnswerException
+#   - 这个异常被捕获后，设置 is_final_answer=True，终止 ReAct 循环
+#   - 使用 BaseException 而非 Exception，防止被代码中的 except Exception 误捕获
+#
+# 状态持久化：
+#   - LocalPythonExecutor 在多步执行之间保持 self.state（变量存储）
+#   - 每步新产生的变量会留在 state 中，供后续步骤使用
+#   - Agent 的 additional_args 也通过 send_variables() 注入 state
+# =============================================================================
+
 import ast
 import builtins
 import difflib
@@ -54,23 +102,33 @@ ERRORS = {
     if isinstance(getattr(builtins, name), type) and issubclass(getattr(builtins, name), BaseException)
 }
 
-DEFAULT_MAX_LEN_OUTPUT = 50000
-MAX_OPERATIONS = 10000000
-MAX_WHILE_ITERATIONS = 1000000
-MAX_EXECUTION_TIME_SECONDS = 30
-ALLOWED_DUNDER_METHODS = ["__init__", "__str__", "__repr__"]
+DEFAULT_MAX_LEN_OUTPUT = 50000   # print 输出的最大长度（字符数），超出则截断
+MAX_OPERATIONS = 10000000        # 最大操作计数（防止无限循环）
+MAX_WHILE_ITERATIONS = 1000000   # while 循环的最大迭代次数
+MAX_EXECUTION_TIME_SECONDS = 30  # 单次代码执行的最大时间（秒）
+ALLOWED_DUNDER_METHODS = ["__init__", "__str__", "__repr__"]  # 允许调用的魔法方法白名单
 
 
 def custom_print(*args):
+    """替换 print()：LLM 生成的代码中的 print 不打印到终端，
+    实际输出被重定向到 state["_print_outputs"]（见 evaluate_python_code 中的实现）。
+    """
     return None
 
 
 def nodunder_getattr(obj, name, default=None):
+    """安全版 getattr：禁止访问双下划线（dunder）属性，防止沙箱逃逸。
+    例如：obj.__class__.__bases__ 这类访问会被拦截。
+    """
     if name.startswith("__") and name.endswith("__"):
         raise InterpreterError(f"Forbidden access to dunder attribute: {name}")
     return getattr(obj, name, default)
 
 
+# 沙箱中默认可用的 Python 内置函数集合
+# LLM 生成的代码只能调用这些函数（以及白名单模块中的函数）
+# 注意：print 被替换为 custom_print（输出重定向到日志）
+# 注意：getattr 被替换为 nodunder_getattr（防止访问危险属性）
 BASE_PYTHON_TOOLS = {
     "print": custom_print,
     "isinstance": isinstance,
@@ -126,7 +184,9 @@ BASE_PYTHON_TOOLS = {
     "complex": complex,
 }
 
-# Non-exhaustive list of dangerous modules that should not be imported
+# 危险模块黑名单（不完整，仅列举最典型的危险模块）
+# 即使这些模块在 authorized_imports 中，也不应允许导入
+# 注意：这个黑名单不是主要防护手段，主要防护靠 authorized_imports 白名单
 DANGEROUS_MODULES = [
     "builtins",
     "io",
@@ -1570,10 +1630,17 @@ def evaluate_ast(
 
 
 class FinalAnswerException(BaseException):
-    """Exception raised when final_answer is called.
+    """final_answer() 被调用时抛出的特殊异常，用于立即终止代码执行并返回答案。
 
-    Inherits from BaseException instead of Exception to prevent being caught
-    by generic `except Exception` clauses in agent-generated code.
+    继承自 BaseException 而非 Exception，是为了防止 LLM 生成的代码中的
+    `except Exception` 子句意外捕获它，导致 final_answer 调用被吞掉。
+    BaseException 只被 `except BaseException` 或裸 `except:` 捕获，更安全。
+
+    工作流程：
+        1. final_answer(value) → 触发 FinalAnswerException(value)
+        2. evaluate_python_code 的 except FinalAnswerException 捕获
+        3. 返回 (e.value, is_final_answer=True)
+        4. CodeAgent 看到 is_final_answer=True，终止 ReAct 循环
     """
 
     def __init__(self, value):
@@ -1627,6 +1694,8 @@ def evaluate_python_code(
     state["_print_outputs"] = PrintContainer()
     state["_operations_count"] = {"counter": 0}
 
+    # 将 final_answer 工具包装为异常触发版本：
+    # 当 LLM 代码调用 final_answer(result) 时，先执行原始工具，再抛出异常终止执行
     if "final_answer" in static_tools:
         previous_final_answer = static_tools["final_answer"]
 
@@ -1669,12 +1738,22 @@ def evaluate_python_code(
 
 @dataclass
 class CodeOutput:
+    """代码执行的完整结果。
+    output: 代码的最终返回值（最后一个表达式的值，或 final_answer 的参数）
+    logs: 代码中 print() 输出的内容（被重定向收集）
+    is_final_answer: 是否调用了 final_answer()（True 则终止 ReAct 循环）
+    """
     output: Any
     logs: str
     is_final_answer: bool
 
 
 class PythonExecutor(ABC):
+    """Python 代码执行器的抽象基类。
+    LocalPythonExecutor：在当前进程内通过 AST 解释器执行（本文件实现）
+    远程执行器（BlaxelExecutor/E2BExecutor/DockerExecutor/ModalExecutor/WasmExecutor）：
+        在隔离的远程环境中执行（见 remote_executors.py）
+    """
     @abstractmethod
     def send_tools(self, tools: dict[str, Tool]) -> None: ...
 

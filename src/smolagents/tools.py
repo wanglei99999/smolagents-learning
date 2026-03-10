@@ -14,6 +14,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# =============================================================================
+# tools.py —— 工具系统的核心文件
+#
+# 本文件定义了 smolagents 中"工具"的抽象层，包含两种定义工具的方式：
+#
+# 方式一：@tool 装饰器（快速方式）
+#   - 最简单的定义方式，用于包装普通 Python 函数
+#   - 必须提供类型注解 (type hints) 和 Args: 文档字符串
+#   - 框架通过这些信息自动生成工具的 name / description / inputs / output_type
+#   - 示例：
+#       @tool
+#       def get_weather(location: str, celsius: bool = True) -> str:
+#           """获取某地天气。
+#           Args:
+#               location: 城市名称
+#               celsius: 是否使用摄氏度
+#           """
+#           return f"{location}: 晴，25°C"
+#
+# 方式二：继承 Tool 类（完整方式）
+#   - 提供完全控制，适合需要延迟初始化（如加载模型）的工具
+#   - 必须定义 name, description, inputs, output_type 类属性
+#   - 核心逻辑写在 forward() 方法中
+#   - 重写 setup() 可实现延迟加载（第一次调用时才执行）
+#
+# 其他重要类：
+#   - ToolCollection：工具集合，支持从 HuggingFace Hub 或 MCP 服务器批量加载工具
+#   - validate_tool_arguments：检查工具参数有效性（由 Agent 在调用前使用）
+#
+# 工具的 inputs 格式：
+#   inputs = {
+#       "param_name": {
+#           "type": "string",        # AUTHORIZED_TYPES 中的类型名
+#           "description": "说明",   # LLM 理解此参数用途的关键
+#           "nullable": True,        # 可选参数需要设置（对应 Python 的 Optional）
+#       }
+#   }
+# =============================================================================
+
 from __future__ import annotations
 
 import ast
@@ -68,6 +108,10 @@ logger = logging.getLogger(__name__)
 
 
 def validate_after_init(cls):
+    """类装饰器：在 __init__ 执行完成后自动调用 validate_arguments() 进行属性验证。
+    通过 __init_subclass__ 钩子，所有 Tool 子类在实例化时都会自动触发验证。
+    这样可以在工具定义有误时立即报错，而不是到运行时才发现问题。
+    """
     original_init = cls.__init__
 
     @wraps(original_init)
@@ -79,6 +123,8 @@ def validate_after_init(cls):
     return cls
 
 
+# 工具参数和返回值允许使用的类型名称（在 inputs["type"] 和 output_type 中使用）
+# 注意：这些是字符串名称，非 Python 类型对象
 AUTHORIZED_TYPES = [
     "string",
     "boolean",
@@ -92,6 +138,8 @@ AUTHORIZED_TYPES = [
     "null",
 ]
 
+# Python 原生类型名 → AUTHORIZED_TYPES 类型名 的转换映射
+# 用于从 LangChain 工具等外部格式导入时的类型转换
 CONVERSION_DICT = {"str": "string", "int": "integer", "float": "number"}
 
 
@@ -229,14 +277,16 @@ class Tool(BaseTool):
         raise NotImplementedError("Write this method in your subclass of `Tool`.")
 
     def __call__(self, *args, sanitize_inputs_outputs: bool = False, **kwargs):
+        """工具调用入口。
+        sanitize_inputs_outputs=True 时（由 Agent 调用），会对 AgentImage/AgentAudio 等类型进行
+        自动转换，确保图像/音频在 Agent 工具链中以正确格式传递。
+        """
         if not self.is_initialized:
-            self.setup()
+            self.setup()  # 延迟初始化：第一次调用时才执行 setup（如加载模型）
 
-        # Handle the arguments might be passed as a single dictionary
+        # 兼容处理：若参数以单个 dict 形式传入，自动展开为 kwargs
         if len(args) == 1 and len(kwargs) == 0 and isinstance(args[0], dict):
             potential_kwargs = args[0]
-
-            # If the dictionary keys match our input parameters, convert it to kwargs
             if all(key in self.inputs for key in potential_kwargs):
                 args = ()
                 kwargs = potential_kwargs
@@ -256,9 +306,14 @@ class Tool(BaseTool):
         self.is_initialized = True
 
     def to_code_prompt(self) -> str:
+        """为 CodeAgent 生成工具的伪代码描述（出现在系统提示词中）。
+        LLM 看到的是类似 Python 函数签名的描述，这样它生成的代码调用方式更自然：
+            def get_weather(location: string, celsius: boolean) -> string:
+                \"\"\"获取天气。Args: location: ..., celsius: ...\"\"\"
+        """
         args_signature = ", ".join(f"{arg_name}: {arg_schema['type']}" for arg_name, arg_schema in self.inputs.items())
 
-        # Use dict type for tools with output schema to indicate structured return
+        # 若工具有结构化输出 Schema，返回类型标注为 dict（提示 LLM 用字段访问方式）
         has_schema = hasattr(self, "output_schema") and self.output_schema is not None
         output_type = "dict" if has_schema else self.output_type
         tool_signature = f"({args_signature}) -> {output_type}"
@@ -1059,8 +1114,18 @@ class ToolCollection:
 
 
 def tool(tool_function: Callable) -> Tool:
-    """
-    Convert a function into an instance of a dynamically created Tool subclass.
+    """@tool 装饰器：将一个普通 Python 函数转换为 Tool 实例。
+
+    实现原理：
+    1. 调用 get_json_schema() 从函数的类型注解和文档字符串中提取元信息
+    2. 动态创建一个 SimpleTool 子类，将函数的 name/description/inputs/output_type 作为类属性
+    3. 将原函数绑定为 forward 方法
+    4. 保留原函数源码（用于序列化 / push_to_hub）
+
+    使用要求（缺一不可）：
+    - 每个参数必须有类型注解（type hint）
+    - 必须有返回值类型注解
+    - docstring 中必须包含 "Args:" 段落描述每个参数（LLM 依赖这些描述理解工具）
 
     Args:
         tool_function (`Callable`): Function to convert into a Tool subclass.
