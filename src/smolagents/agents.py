@@ -1877,16 +1877,41 @@ class ToolCallingAgent(MultiStepAgent):
         )
 
     def _substitute_state_variables(self, arguments: dict[str, str] | str) -> dict[str, Any] | str:
-        """Replace string values in arguments with their corresponding state values if they exist."""
+        """
+        状态变量替换器：将参数中的变量名替换为实际存储的对象
+        
+        在多步推理中，前面步骤的结果（如图片、数据框）会被存储到 self.state 中。
+        后续步骤的 LLM 只能通过字符串变量名来引用这些对象，这个方法负责将变量名解析为实际对象。
+        
+        例如：
+        - self.state = {"image.png": <PIL.Image>, "data": <DataFrame>}
+        - arguments = {"img": "image.png", "threshold": 0.5}
+        - 返回: {"img": <PIL.Image>, "threshold": 0.5}
+        
+        Replace string values in arguments with their corresponding state values if they exist.
+        """
+        # 如果参数是字典，遍历每个键值对进行替换
         if isinstance(arguments, dict):
             return {
-                key: self.state.get(value, value) if isinstance(value, str) else value
+                key: self.state.get(value, value)  # 如果 value 是状态中的变量名，替换为实际值；否则保持原值
+                     if isinstance(value, str)      # 只替换字符串类型的值（可能是变量名）
+                     else value                     # 非字符串值（数字、列表等）直接保留
                 for key, value in arguments.items()
             }
+        # 如果参数不是字典（可能是单个字符串），直接返回
         return arguments
 
     def execute_tool_call(self, tool_name: str, arguments: dict[str, str] | str) -> Any:
         """
+        工具执行器：执行指定的工具或子 Agent
+        
+        这是工具调用的核心方法，负责：
+        1. 验证工具是否存在
+        2. 替换参数中的状态变量
+        3. 验证参数格式
+        4. 实际执行工具
+        5. 处理执行错误
+        
         Execute a tool or managed agent with the provided arguments.
 
         The arguments are replaced with the actual values from the state if they refer to state variables.
@@ -1895,36 +1920,56 @@ class ToolCallingAgent(MultiStepAgent):
             tool_name (`str`): Name of the tool or managed agent to execute.
             arguments (dict[str, str] | str): Arguments passed to the tool call.
         """
+        # === 第1步：检查工具是否存在 ===
         # Check if the tool exists
+        # 合并普通工具和子 Agent（它们都可以被调用）
+        # 【**】是字典解包的意思 
         available_tools = {**self.tools, **self.managed_agents}
         if tool_name not in available_tools:
+            # 工具不存在，抛出友好的错误提示
             raise AgentToolExecutionError(
                 f"Unknown tool {tool_name}, should be one of: {', '.join(available_tools)}.", self.logger
             )
 
+        # === 第2步：准备工具和参数 ===
         # Get the tool and substitute state variables in arguments
-        tool = available_tools[tool_name]
+        tool = available_tools[tool_name]  # 获取工具对象
+        # 替换参数中的状态变量（如 "image.png" → <PIL.Image>）
         arguments = self._substitute_state_variables(arguments)
+        # 判断是工具还是子 Agent（影响错误提示和调用方式）
         is_managed_agent = tool_name in self.managed_agents
 
+        # === 第3步：验证参数 ===
         try:
+            # 检查参数是否符合工具的输入规范（类型、必填项等）
             validate_tool_arguments(tool, arguments)
         except (ValueError, TypeError) as e:
+            # 参数格式错误（如缺少必填参数、类型不匹配）
             raise AgentToolCallError(str(e), self.logger) from e
         except Exception as e:
+            # 其他验证错误
             error_msg = f"Error executing tool '{tool_name}' with arguments {str(arguments)}: {type(e).__name__}: {e}"
             raise AgentToolExecutionError(error_msg, self.logger) from e
 
+        # === 第4步：执行工具 ===
         try:
             # Call tool with appropriate arguments
+            # 根据参数类型选择调用方式
             if isinstance(arguments, dict):
+                # 字典参数：使用关键字参数调用，例如：tool(location="Paris", units="metric")
+                # 子 Agent 不需要 sanitize（它们自己会处理输入输出）
+                # 普通工具需要 sanitize（清理和验证输入输出）
                 return tool(**arguments) if is_managed_agent else tool(**arguments, sanitize_inputs_outputs=True)
             else:
+                # 单个参数：直接传递，例如：tool("search query")
                 return tool(arguments) if is_managed_agent else tool(arguments, sanitize_inputs_outputs=True)
 
         except Exception as e:
+            # === 第5步：处理执行错误 ===
             # Handle execution errors
+            # 根据是工具还是子 Agent 生成不同的错误提示
             if is_managed_agent:
+                # 子 Agent 执行失败：建议尝试其他团队成员
                 error_msg = (
                     f"Error executing request to team member '{tool_name}' with arguments {str(arguments)}: {e}\n"
                     "Please try again or request to another team member"
@@ -1963,6 +2008,38 @@ class ToolCallingAgent(MultiStepAgent):
 # =============================================================================
 class CodeAgent(MultiStepAgent):
     """
+    CodeAgent：基于代码生成的智能体实现
+    
+    这是 smolagents 的核心 Agent 类型，LLM 通过生成 Python 代码来执行任务。
+    相比 ToolCallingAgent 的 JSON 调用方式，CodeAgent 更灵活、更强大。
+    
+    核心特点：
+    1. LLM 生成 Python 代码而非 JSON
+    2. 支持复杂逻辑（循环、条件判断、变量）
+    3. 可以组合多个工具调用
+    4. 性能更好（比传统方法少 30% 的步骤）
+    
+    工作原理：
+    ```
+    LLM 输出：
+    <code>
+    result = web_search("Python教程")
+    for item in result[:3]:
+        print(item)
+    final_answer(result)
+    </code>
+    
+    → 解析代码块
+    → 在沙箱中执行
+    → 收集输出作为观察
+    → 继续下一轮推理
+    ```
+    
+    安全性：
+    - 代码在沙箱环境中执行（local/e2b/docker/modal/wasm）
+    - 限制 import 白名单
+    - 截断过长的输出
+    
     In this agent, the tool calls will be formulated by the LLM in code format, then parsed and executed.
 
     Args:
@@ -1970,16 +2047,33 @@ class CodeAgent(MultiStepAgent):
         model (`Model`): Model that will generate the agent's actions.
         prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
+            额外授权的 Python 模块，例如 ["pandas", "numpy"]
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
         executor ([`PythonExecutor`], *optional*): Custom Python code executor. If not provided, a default executor will be created based on `executor_type`.
+            自定义代码执行器，通常不需要手动提供
         executor_type (`Literal["local", "blaxel", "e2b", "modal", "docker", "wasm"]`, default `"local"`): Type of code executor.
+            代码执行环境类型：
+            - "local": 本地沙箱（最快，安全性较低）
+            - "e2b": E2B 云沙箱（安全，需要 API key）
+            - "docker": Docker 容器（安全，需要 Docker）
+            - "modal": Modal 云函数（安全，需要账号）
+            - "wasm": WebAssembly 沙箱（安全，浏览器兼容）
+            - "blaxel": Blaxel 云沙箱（安全，需要 API key）
         executor_kwargs (`dict`, *optional*): Additional arguments to pass to initialize the executor.
         max_print_outputs_length (`int`, *optional*): Maximum length of the print outputs.
+            截断过长的 print 输出，防止超出 LLM 上下文限制
         stream_outputs (`bool`, *optional*, default `False`): Whether to stream outputs during execution.
+            是否流式输出 LLM 生成的代码（实时显示）
         use_structured_outputs_internally (`bool`, default `False`): Whether to use structured generation at each action step: improves performance for many models.
+            是否使用结构化输出（强制 LLM 输出 JSON 格式的 {"thought": "...", "code": "..."}）
+            优点：减少解析错误；缺点：不是所有模型都支持
 
             <Added version="1.17.0"/>
         code_block_tags (`tuple[str, str]` | `Literal["markdown"]`, *optional*): Opening and closing tags for code blocks (regex strings). Pass a custom tuple, or pass 'markdown' to use ("```(?:python|py)", "\\n```"), leave empty to use ("<code>", "</code>").
+            代码块标签：
+            - None: 使用默认 ("<code>", "</code>")
+            - "markdown": 使用 Markdown 格式 ("```python", "```")
+            - 自定义元组: 例如 ("<<<", ">>>")
         **kwargs: Additional keyword arguments.
     """
 
@@ -1999,11 +2093,25 @@ class CodeAgent(MultiStepAgent):
         code_block_tags: str | tuple[str, str] | None = None,
         **kwargs,
     ):
+        """
+        初始化 CodeAgent
+        
+        这个构造函数负责：
+        1. 设置 import 白名单（安全控制）
+        2. 加载提示词模板（普通模式 vs 结构化模式）
+        3. 配置代码块标签（如何识别代码）
+        4. 创建 Python 执行器（本地 vs 远程沙箱）
+        """
+        # === 第1步：配置 import 白名单 ===
         # import 白名单 = 内置安全模块 + 用户额外授权的模块
         # 沙箱执行器会拦截所有不在白名单中的 import 语句
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
+        
+        # === 第2步：配置输出限制 ===
         self.max_print_outputs_length = max_print_outputs_length  # 截断过长的 print 输出，防止超出上下文
+        
+        # === 第3步：选择提示词模板 ===
         self._use_structured_outputs_internally = use_structured_outputs_internally
         # 结构化输出模式：使用 JSON Schema 强制 LLM 输出 {"thought": "...", "code": "..."} 格式
         # 优点：减少代码块解析错误；缺点：并非所有模型都支持
@@ -2012,20 +2120,25 @@ class CodeAgent(MultiStepAgent):
                 importlib.resources.files("smolagents.prompts").joinpath("structured_code_agent.yaml").read_text()
             )
         else:
+            # 默认模式：LLM 自由输出，通过正则表达式解析代码块
             prompt_templates = prompt_templates or yaml.safe_load(
                 importlib.resources.files("smolagents.prompts").joinpath("code_agent.yaml").read_text()
             )
 
+        # === 第4步：配置代码块标签 ===
+        # 代码块标签用于从 LLM 输出中提取代码
         if isinstance(code_block_tags, str) and not code_block_tags == "markdown":
             raise ValueError("Only 'markdown' is supported for a string argument to `code_block_tags`.")
         self.code_block_tags = (
             code_block_tags
-            if isinstance(code_block_tags, tuple)
-            else ("```python", "```")
+            if isinstance(code_block_tags, tuple)  # 自定义标签，如 ("<<<", ">>>")
+            else ("```python", "```")              # Markdown 格式
             if code_block_tags == "markdown"
-            else ("<code>", "</code>")
+            else ("<code>", "</code>")             # 默认 XML 格式
         )
 
+        # === 第5步：调用父类初始化 ===
+        # 初始化工具、模型、记忆等通用组件
         super().__init__(
             tools=tools,
             model=model,
@@ -2033,18 +2146,27 @@ class CodeAgent(MultiStepAgent):
             planning_interval=planning_interval,
             **kwargs,
         )
+        
+        # === 第6步：配置流式输出 ===
         self.stream_outputs = stream_outputs
         if self.stream_outputs and not hasattr(self.model, "generate_stream"):
+            # 检查模型是否支持流式生成
             raise ValueError(
                 "`stream_outputs` is set to True, but the model class implements no `generate_stream` method."
             )
+        
+        # === 第7步：安全警告 ===
         if "*" in self.additional_authorized_imports:
+            # 如果允许所有 import，发出警告（可能导入不存在的包）
             self.logger.log(
                 "Caution: you set an authorization for all imports, meaning your agent can decide to import any package it deems necessary. This might raise issues if the package is not installed in your environment.",
                 level=LogLevel.INFO,
             )
+        
+        # === 第8步：创建 Python 执行器 ===
         self.executor_type = executor_type
         self.executor_kwargs: dict[str, Any] = executor_kwargs or {}
+        # 如果用户没有提供自定义执行器，根据 executor_type 创建默认执行器
         self.python_executor = executor or self.create_python_executor()
 
     def __enter__(self):
