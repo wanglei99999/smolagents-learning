@@ -153,6 +153,25 @@ class BaseTool(ABC):
 
 class Tool(BaseTool):
     """
+    工具基类 - 所有工具的父类
+    
+    这是 smolagents 中定义工具的标准方式。继承这个类可以创建自定义工具。
+    
+    必须定义的类属性：
+    - name (str): 工具名称，必须是有效的 Python 标识符（LLM 会用这个名字调用工具）
+    - description (str): 工具描述，告诉 LLM 这个工具是做什么的
+    - inputs (dict): 输入参数的 JSON Schema 格式定义
+    - output_type (str): 输出类型（必须是 AUTHORIZED_TYPES 中的一个）
+    
+    可选的类属性：
+    - output_schema (dict): 输出的 JSON Schema（用于结构化输出）
+    
+    必须实现的方法：
+    - forward(*args, **kwargs): 工具的核心逻辑
+    
+    可选重写的方法：
+    - setup(): 延迟初始化（如加载模型），第一次调用时执行
+    
     A base class for the functions used by the agent. Subclass this and implement the `forward` method as well as the
     following class attributes:
 
@@ -174,6 +193,22 @@ class Tool(BaseTool):
     You can also override the method [`~Tool.setup`] if your tool has an expensive operation to perform before being
     usable (such as loading a model). [`~Tool.setup`] will be called the first time you use your tool, but not at
     instantiation.
+    
+    Example:
+        ```python
+        class WeatherTool(Tool):
+            name = "get_weather"
+            description = "获取指定城市的天气信息"
+            inputs = {
+                "location": {"type": "string", "description": "城市名称"},
+                "celsius": {"type": "boolean", "description": "是否使用摄氏度", "nullable": True}
+            }
+            output_type = "string"
+            
+            def forward(self, location: str, celsius: bool = True):
+                # 实际的天气查询逻辑
+                return f"{location}: 晴天，25°C"
+        ```
     """
 
     name: str

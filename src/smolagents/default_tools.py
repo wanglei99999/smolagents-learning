@@ -14,6 +14,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# =============================================================================
+# default_tools.py —— smolagents 的内置工具集
+#
+# 本文件定义了 Agent 可以使用的所有默认工具，包括：
+#   1. PythonInterpreterTool - Python 代码解释器（用于 ToolCallingAgent）
+#   2. FinalAnswerTool - 返回最终答案（所有 Agent 必备）
+#   3. UserInputTool - 请求用户输入
+#   4. WebSearchTool 系列 - 网页搜索工具（DuckDuckGo/Google/Bing/API）
+#   5. VisitWebpageTool - 访问网页并提取内容
+#   6. WikipediaSearchTool - 维基百科搜索
+#   7. SpeechToTextTool - 语音转文字
+#
+# 工具设计原则：
+#   - 每个工具都继承自 Tool 基类
+#   - 必须定义 name, description, inputs, output_type
+#   - 核心逻辑在 forward() 方法中实现
+# =============================================================================
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +55,22 @@ class PreTool:
 
 
 class PythonInterpreterTool(Tool):
+    """
+    Python 代码解释器工具
+    
+    这个工具主要用于 ToolCallingAgent，让它可以执行 Python 代码。
+    注意：CodeAgent 不需要这个工具，因为它直接执行代码。
+    
+    功能：
+    - 在沙箱环境中执行 Python 代码
+    - 限制可导入的模块（安全控制）
+    - 捕获 print 输出和返回值
+    - 设置执行超时（防止死循环）
+    
+    使用场景：
+    - ToolCallingAgent 需要执行计算
+    - 需要处理数据但不想用 CodeAgent
+    """
     name = "python_interpreter"
     description = "This is a tool that evaluates python code. It can be used to perform calculations."
     inputs = {
@@ -48,10 +82,20 @@ class PythonInterpreterTool(Tool):
     output_type = "string"
 
     def __init__(self, *args, authorized_imports=None, timeout_seconds=MAX_EXECUTION_TIME_SECONDS, **kwargs):
+        """
+        初始化 Python 解释器工具
+        
+        Args:
+            authorized_imports: 额外授权的 Python 模块列表
+            timeout_seconds: 代码执行超时时间（秒）
+        """
+        # 设置 import 白名单：基础模块 + 用户授权的模块
         if authorized_imports is None:
             self.authorized_imports = list(set(BASE_BUILTIN_MODULES))
         else:
             self.authorized_imports = list(set(BASE_BUILTIN_MODULES) | set(authorized_imports))
+        
+        # 更新输入描述，告诉 LLM 可以导入哪些模块
         self.inputs = {
             "code": {
                 "type": "string",
@@ -61,13 +105,30 @@ class PythonInterpreterTool(Tool):
                 ),
             }
         }
-        self.base_python_tools = BASE_PYTHON_TOOLS
-        self.python_evaluator = evaluate_python_code
+        self.base_python_tools = BASE_PYTHON_TOOLS  # 基础工具（如 final_answer）
+        self.python_evaluator = evaluate_python_code  # 代码执行器
         self.timeout_seconds = timeout_seconds
         super().__init__(*args, **kwargs)
 
     def forward(self, code: str) -> str:
-        state = {}
+        """
+        执行 Python 代码并返回结果
+        
+        Args:
+            code: 要执行的 Python 代码字符串
+            
+        Returns:
+            格式化的执行结果，包含 stdout 和返回值
+            
+        Example:
+            >>> tool = PythonInterpreterTool()
+            >>> result = tool.forward("print('Hello'); 2 + 3")
+            >>> print(result)
+            Stdout:
+            Hello
+            Output: 5
+        """
+        state = {}  # 用于存储执行状态（如 print 输出）
         output = str(
             self.python_evaluator(
                 code,
@@ -75,38 +136,89 @@ class PythonInterpreterTool(Tool):
                 static_tools=self.base_python_tools,
                 authorized_imports=self.authorized_imports,
                 timeout_seconds=self.timeout_seconds,
-            )[0]  # The second element is boolean is_final_answer
+            )[0]  # 第一个元素是返回值，第二个元素是 is_final_answer 标志
         )
+        # 返回格式化的结果：stdout + 返回值
         return f"Stdout:\n{str(state['_print_outputs'])}\nOutput: {output}"
 
 
 class FinalAnswerTool(Tool):
+    """
+    最终答案工具（所有 Agent 的必备工具）
+    
+    这是一个特殊的工具，用于标记任务完成并返回最终答案。
+    当 Agent 调用这个工具时，ReAct 循环会终止。
+    
+    工作原理：
+    - ToolCallingAgent: 调用 {"tool": "final_answer", "arguments": {"answer": "..."}}
+    - CodeAgent: 调用 final_answer("...")
+    
+    注意：这个工具不做任何处理，只是原样返回答案
+    """
     name = "final_answer"
     description = "Provides a final answer to the given problem."
     inputs = {"answer": {"type": "any", "description": "The final answer to the problem"}}
     output_type = "any"
 
     def forward(self, answer: Any) -> Any:
+        """直接返回答案，不做任何处理"""
         return answer
 
 
 class UserInputTool(Tool):
+    """
+    用户输入工具
+    
+    允许 Agent 在执行过程中向用户提问并获取输入。
+    这对于需要用户确认或提供额外信息的场景很有用。
+    
+    使用场景：
+    - Agent 需要用户确认某个操作
+    - Agent 需要用户提供额外信息（如密码、选择等）
+    - 交互式对话流程
+    
+    Example:
+        Agent: "我找到了3个选项，你想选择哪一个？"
+        User: "选择第2个"
+    """
     name = "user_input"
     description = "Asks for user's input on a specific question"
     inputs = {"question": {"type": "string", "description": "The question to ask the user"}}
     output_type = "string"
 
     def forward(self, question):
+        """
+        向用户提问并等待输入
+        
+        Args:
+            question: 要问用户的问题
+            
+        Returns:
+            用户的输入（字符串）
+        """
         user_input = input(f"{question} => Type your answer here:")
         return user_input
 
 
 class DuckDuckGoSearchTool(Tool):
-    """Web search tool that performs searches using the DuckDuckGo search engine.
+    """
+    DuckDuckGo 网页搜索工具
+    
+    使用 DuckDuckGo 搜索引擎进行网页搜索（类似 Google 搜索）。
+    优点：免费、无需 API key、隐私友好
+    
+    功能：
+    - 搜索网页并返回前 N 个结果
+    - 支持速率限制（防止被封禁）
+    - 返回格式化的 Markdown 结果（标题、链接、摘要）
+    
+    Web search tool that performs searches using the DuckDuckGo search engine.
 
     Args:
         max_results (`int`, default `10`): Maximum number of search results to return.
+            最多返回多少个搜索结果
         rate_limit (`float`, default `1.0`): Maximum queries per second. Set to `None` to disable rate limiting.
+            每秒最多查询次数（None 表示不限制）
         **kwargs: Additional keyword arguments for the `DDGS` client.
 
     Examples:
@@ -127,8 +239,11 @@ class DuckDuckGoSearchTool(Tool):
         super().__init__()
         self.max_results = max_results
         self.rate_limit = rate_limit
+        # 计算最小请求间隔（用于速率限制）
         self._min_interval = 1.0 / rate_limit if rate_limit else 0.0
         self._last_request_time = 0.0
+        
+        # 导入 DuckDuckGo 搜索库
         try:
             from ddgs import DDGS
         except ImportError as e:
@@ -138,22 +253,52 @@ class DuckDuckGoSearchTool(Tool):
         self.ddgs = DDGS(**kwargs)
 
     def forward(self, query: str) -> str:
+        """
+        执行搜索并返回格式化的结果
+        
+        Args:
+            query: 搜索查询字符串
+            
+        Returns:
+            Markdown 格式的搜索结果
+            
+        Example:
+            ## Search Results
+            
+            [Python Tutorial](https://example.com)
+            Learn Python programming...
+            
+            [Python Documentation](https://docs.python.org)
+            Official Python docs...
+        """
+        # 执行速率限制（避免请求过快被封禁）
         self._enforce_rate_limit()
+        
+        # 执行搜索
         results = self.ddgs.text(query, max_results=self.max_results)
         if len(results) == 0:
             raise Exception("No results found! Try a less restrictive/shorter query.")
+        
+        # 格式化结果为 Markdown
         postprocessed_results = [f"[{result['title']}]({result['href']})\n{result['body']}" for result in results]
         return "## Search Results\n\n" + "\n\n".join(postprocessed_results)
 
     def _enforce_rate_limit(self) -> None:
+        """
+        强制执行速率限制
+        
+        如果距离上次请求的时间太短，会 sleep 等待。
+        这样可以避免请求过快被 DuckDuckGo 封禁。
+        """
         import time
 
-        # No rate limit enforced
+        # 如果没有设置速率限制，直接返回
         if not self.rate_limit:
             return
 
         now = time.time()
         elapsed = now - self._last_request_time
+        # 如果距离上次请求时间太短，等待
         if elapsed < self._min_interval:
             time.sleep(self._min_interval - elapsed)
         self._last_request_time = time.time()
@@ -638,24 +783,30 @@ class SpeechToTextTool(PipelineTool):
         return self.pre_processor.batch_decode(outputs, skip_special_tokens=True)[0]
 
 
+# =============================================================================
+# 工具映射表：用于 add_base_tools=True 时自动添加工具
+# =============================================================================
 TOOL_MAPPING = {
     tool_class.name: tool_class
     for tool_class in [
-        PythonInterpreterTool,
-        DuckDuckGoSearchTool,
-        VisitWebpageTool,
+        PythonInterpreterTool,      # Python 代码解释器
+        DuckDuckGoSearchTool,        # DuckDuckGo 搜索
+        VisitWebpageTool,            # 访问网页
     ]
 }
 
+# =============================================================================
+# 导出的工具类列表
+# =============================================================================
 __all__ = [
-    "ApiWebSearchTool",
-    "PythonInterpreterTool",
-    "FinalAnswerTool",
-    "UserInputTool",
-    "WebSearchTool",
-    "DuckDuckGoSearchTool",
-    "GoogleSearchTool",
-    "VisitWebpageTool",
-    "WikipediaSearchTool",
-    "SpeechToTextTool",
+    "ApiWebSearchTool",          # API 网页搜索（Brave Search）
+    "PythonInterpreterTool",     # Python 解释器
+    "FinalAnswerTool",           # 最终答案工具
+    "UserInputTool",             # 用户输入工具
+    "WebSearchTool",             # 通用网页搜索（支持多引擎）
+    "DuckDuckGoSearchTool",      # DuckDuckGo 搜索
+    "GoogleSearchTool",          # Google 搜索（需要 API key）
+    "VisitWebpageTool",          # 访问网页
+    "WikipediaSearchTool",       # 维基百科搜索
+    "SpeechToTextTool",          # 语音转文字
 ]
