@@ -791,10 +791,10 @@ You have been provided with these additional arguments, that you can access dire
         
         # ReAct 主循环：持续执行直到得到答案或达到步数上限
         while not returned_final_answer and self.step_number <= max_steps:
-            if self.interrupt_switch:  # 支持从外部调用 agent.interrupt() 中断执行
+            if self.interrupt_switch:  # 支持从外部调用 agent.interrupt() 中断执行，给了一个优雅终止长任务的入口
                 raise AgentError("Agent interrupted.", self.logger)
 
-            # ========== 阶段 1：规划步骤（可选） ==========
+            # ========== 阶段 1：规划步骤（可选）PlanningStep  ==========
             # 检查是否需要触发规划步骤（第 1 步 或 每隔 planning_interval 步）
             # 规划步骤会让 LLM 生成/更新执行计划，帮助 Agent 保持方向感
             if self.planning_interval is not None and (
@@ -819,7 +819,7 @@ You have been provided with these additional arguments, that you can access dire
                 self._finalize_step(planning_step)
                 self.memory.steps.append(planning_step)
 
-            # ========== 阶段 2：行动步骤（核心） ==========
+            # ========== 阶段 2：行动步骤（核心）ActionStep ==========
             # 开始执行一个行动步骤（Action Step）
             action_step_start_time = time.time()
             action_step = ActionStep(
@@ -827,6 +827,21 @@ You have been provided with these additional arguments, that you can access dire
                 timing=Timing(start_time=action_step_start_time),
                 observations_images=images,  # 多模态输入：将图片注入每一步的观察中
             )
+            # 注意：这里还没有真正执行“动作”。
+            # 这一步只是先创建一个 ActionStep 容器，用来记录当前这一轮 ReAct 循环里发生的所有事情。
+            # 后面这一轮执行过程中产生的内容，都会逐步写回这个对象，例如：
+            # - 发给模型的输入消息
+            # - 模型输出
+            # - 解析出的工具调用或代码
+            # - 工具/代码执行后的 observation
+            # - 错误信息、token 使用量、是否已经得到最终答案
+            #
+            # 真正的执行发生在下面的 self._step_stream(action_step)：
+            # - ToolCallingAgent：生成并执行 tool calls
+            # - CodeAgent：生成并执行 Python 代码
+            #
+            # 之所以先创建 ActionStep，再执行动作，是因为无论成功还是失败，
+            # 框架都需要一个统一的记录对象在最后写入 memory，供下一轮推理和调试回放使用。
             self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
             try:
                 # 执行一步 ReAct 循环：思考 → 行动 → 观察
@@ -884,6 +899,24 @@ You have been provided with these additional arguments, that you can access dire
                 raise AgentError(f"Check {check_function.__name__} failed with error: {e}", self.logger)
 
     def _finalize_step(self, memory_step: ActionStep | PlanningStep | FinalAnswerStep):
+        # 统一收尾一个 step。
+        # 这个方法不负责执行推理，也不负责把 step 写入 memory，
+        # 它只负责“某一步已经结束后”的公共收尾逻辑。
+        #
+        # 作用 1：补齐结束时间
+        # 对 ActionStep 和 PlanningStep，需要在这里写入 timing.end_time，
+        # 这样 monitoring.py 里的 Timing.duration 才能正确计算本步耗时。
+        # FinalAnswerStep 更像一个结果封装事件，而不是一次完整的执行过程，
+        # 因此这里不额外补 end_time。
+        #
+        # 作用 2：触发回调
+        # 调用 self.step_callbacks.callback(...)，把当前 step 分发给已注册的回调函数。
+        # 这些回调通常用于：
+        # - 更新监控指标（如 token、耗时）
+        # - 输出日志
+        # - 自定义调试或埋点
+        #
+        # 可以把它理解成“step 生命周期结束时的统一钩子”。
         if not isinstance(memory_step, FinalAnswerStep):
             memory_step.timing.end_time = time.time()
         self.step_callbacks.callback(memory_step, agent=self)
