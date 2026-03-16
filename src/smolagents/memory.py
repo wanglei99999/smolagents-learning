@@ -90,34 +90,67 @@ class MemoryStep:
 @dataclass
 class ActionStep(MemoryStep):
     """一步完整的 ReAct 行动记录（记忆中最核心的步骤类型）。
+    
+    ActionStep 是 ReAct 循环中最重要的数据结构，它记录了一轮完整的 Think-Act-Observe 过程。
+    每个 ActionStep 包含：
+    1. Think（思考）：model_output - LLM 的推理过程
+    2. Act（行动）：tool_calls/code_action - 要执行的工具调用或代码
+    3. Observe（观察）：observations - 执行结果
+    
+    这个类承担双重角色：
+    - 运行记录：保存执行历史，用于调试和回放
+    - 下一轮输入：通过 to_messages() 转换为 LLM 的上下文
+    
     字段说明：
       step_number: 步骤编号（从 1 开始）
+      timing: 执行时间统计（开始时间、结束时间、耗时）
       model_input_messages: 本步发给 LLM 的完整消息列表（包含历史）
-      model_output: LLM 的原始输出（含思考和行动描述）
+      model_output_message: LLM 返回的完整消息对象（包含 tool_calls 等元数据）
+      model_output: LLM 的原始输出文本（含思考和行动描述）
       code_action: 从 model_output 解析出的 Python 代码（CodeAgent 专用）
       tool_calls: 解析出的工具调用列表（ToolCallingAgent 专用）
-      observations: 代码/工具执行后的输出结果字符串（写入下一步的上下文）
+      observations: 代码/工具执行后的输出结果字符串（写入下一步的上下文）⭐ ReAct 的关键
       observations_images: 多模态输入的图像（每步都会传入）
       action_output: 代码执行的 Python 返回值（未序列化的原始对象）
       error: 执行错误（LLM 下一步会看到错误并尝试修正）
+      token_usage: 本步的 token 使用统计（输入 token 数、输出 token 数）
       is_final_answer: 是否是最后一步（调用了 final_answer 工具/函数）
     """
-    step_number: int
-    timing: Timing
-    model_input_messages: list[ChatMessage] | None = None
-    tool_calls: list[ToolCall] | None = None
-    error: AgentError | None = None
-    model_output_message: ChatMessage | None = None
-    model_output: str | list[dict[str, Any]] | None = None
-    code_action: str | None = None
-    observations: str | None = None
-    observations_images: list["PIL.Image.Image"] | None = None
-    action_output: Any = None
-    token_usage: TokenUsage | None = None
-    is_final_answer: bool = False
+    # === 基础信息 ===
+    step_number: int  # 步骤编号，用于标识这是第几轮 ReAct 循环
+    timing: Timing  # 时间统计：start_time, end_time, duration
+    
+    # === Think（思考）阶段的数据 ===
+    model_input_messages: list[ChatMessage] | None = None  # 发给 LLM 的输入（包含历史上下文）
+    model_output_message: ChatMessage | None = None  # LLM 返回的完整消息对象
+    model_output: str | list[dict[str, Any]] | None = None  # LLM 的文本输出（推理过程）
+    
+    # === Act（行动）阶段的数据 ===
+    tool_calls: list[ToolCall] | None = None  # ToolCallingAgent：解析出的工具调用列表
+    code_action: str | None = None  # CodeAgent：解析出的 Python 代码
+    
+    # === Observe（观察）阶段的数据 ===
+    observations: str | None = None  # 执行结果（字符串格式），会被写入下一轮的 LLM 输入
+    observations_images: list["PIL.Image.Image"] | None = None  # 多模态：图像输入
+    action_output: Any = None  # 原始的 Python 对象（未序列化）
+    error: AgentError | None = None  # 执行错误（也是观察的一部分）
+    
+    # === 元数据 ===
+    token_usage: TokenUsage | None = None  # Token 使用统计（用于成本计算）
+    is_final_answer: bool = False  # 是否调用了 final_answer（标记循环结束）
 
     def dict(self):
-        # We overwrite the method to parse the tool_calls and action_output manually
+        """将 ActionStep 序列化为字典（用于保存和传输）。
+        
+        这个方法手动处理复杂字段的序列化：
+        - tool_calls: 转换为字典列表
+        - action_output: 使用 make_json_serializable 处理任意 Python 对象
+        - model_input_messages: 递归序列化嵌套的 dataclass
+        - observations_images: 转换为字节数据
+        
+        Returns:
+            dict: 可 JSON 序列化的字典
+        """
         return {
             "step_number": self.step_number,
             "timing": self.timing.dict(),
@@ -143,17 +176,49 @@ class ActionStep(MemoryStep):
         }
 
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        """将此步骤序列化为消息列表，供下一步 LLM 调用使用。
-        summary_mode=True：省略 model_output（减少 token），仅保留工具调用和观察结果，
-                           用于 planning_interval 触发规划时的历史摘要。
-        summary_mode=False：完整输出，用于常规下一步的上下文。
+        """⭐ ReAct 框架的核心方法：将此步骤转换为 LLM 的输入消息。
+        
+        这个方法实现了 ReAct 的"反馈闭环"：
+        1. 将本步的 observations（观察结果）转换为消息
+        2. 下一轮 LLM 调用时会看到这些消息
+        3. LLM 基于观察结果调整策略
+        
+        消息顺序（对应 ReAct 的三个阶段）：
+        1. Think: model_output（LLM 的推理过程）
+        2. Act: tool_calls（工具调用或代码）
+        3. Observe: observations（执行结果）或 error（错误信息）
+        
+        Args:
+            summary_mode: 是否使用摘要模式
+                - False（默认）：完整输出，包含 model_output
+                - True：省略 model_output，只保留工具调用和观察（用于规划时减少 token）
+        
+        Returns:
+            list[ChatMessage]: 消息列表，会被添加到下一轮 LLM 的输入中
+        
+        Example:
+            >>> action_step = ActionStep(
+            ...     model_output="我需要搜索天气",
+            ...     tool_calls=[ToolCall(name="web_search", ...)],
+            ...     observations="Paris: 20°C"
+            ... )
+            >>> messages = action_step.to_messages()
+            >>> # messages 包含：
+            >>> # 1. {"role": "assistant", "content": "我需要搜索天气"}
+            >>> # 2. {"role": "tool_call", "content": "Calling tools: ..."}
+            >>> # 3. {"role": "tool_response", "content": "Observation: Paris: 20°C"}
         """
         messages = []
+        
+        # === 1. Think（思考）：LLM 的推理过程 ===
+        # 在摘要模式下省略，因为推理过程通常很长，且对下一步不是必需的
         if self.model_output is not None and not summary_mode:
             messages.append(
                 ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": self.model_output.strip()}])
             )
 
+        # === 2. Act（行动）：工具调用或代码 ===
+        # 告诉 LLM "我调用了哪些工具"
         if self.tool_calls is not None:
             messages.append(
                 ChatMessage(
@@ -167,6 +232,7 @@ class ActionStep(MemoryStep):
                 )
             )
 
+        # === 多模态支持：图像输入 ===
         if self.observations_images:
             messages.append(
                 ChatMessage(
@@ -181,6 +247,8 @@ class ActionStep(MemoryStep):
                 )
             )
 
+        # === 3. Observe（观察）：执行结果 ===
+        # ⭐ 这是 ReAct 闭环的关键：将执行结果传递给下一轮 LLM
         if self.observations is not None:
             messages.append(
                 ChatMessage(
@@ -193,6 +261,9 @@ class ActionStep(MemoryStep):
                     ],
                 )
             )
+        
+        # === 错误也是观察的一部分 ===
+        # 让 LLM 看到错误信息，从而能够自我纠错
         if self.error is not None:
             error_message = (
                 "Error:\n"
