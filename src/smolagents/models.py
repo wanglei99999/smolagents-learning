@@ -117,6 +117,16 @@ CODEAGENT_RESPONSE_FORMAT = {
 
 
 def get_dict_from_nested_dataclasses(obj, ignore_key=None):
+    """把嵌套的 dataclass 对象递归转成普通 dict。
+
+    ChatMessage 里嵌套了 ChatMessageToolCall，里面又嵌套了 ChatMessageToolCallFunction。
+    这个函数会递归地把它们全部转成 dict。
+
+    ignore_key 用于跳过某个字段，比如 ignore_key="raw" 可以在序列化时
+    跳过原始 API 响应（太大，不需要存）。
+
+    被 ChatMessage.dict() 和 ChatMessage.model_dump_json() 调用。
+    """
     def convert(obj):
         if hasattr(obj, "__dataclass_fields__"):
             return {k: convert(v) for k, v in asdict(obj).items() if k != ignore_key}
@@ -126,10 +136,16 @@ def get_dict_from_nested_dataclasses(obj, ignore_key=None):
 
 
 def remove_content_after_stop_sequences(content: str | None, stop_sequences: list[str] | None) -> str | None:
-    """Remove content after any stop sequence is encountered.
+    """在停止词处截断文本。
 
-    Some providers may return ``None`` content (for example when responding purely with tool calls),
-    so we skip processing in that case.
+    有些模型不支持 stop 参数（supports_stop_parameter 返回 False），
+    生成的文本可能包含停止词之后的多余内容。这个函数做事后截断：
+      remove_content_after_stop_sequences("答案是42。END多余内容", ["END"])
+      → "答案是42。"
+
+    每个模型的 generate() 末尾都会调用：
+      if stop_sequences is not None and not self.supports_stop_parameter:
+          content = remove_content_after_stop_sequences(content, stop_sequences)
     """
     if content is None or not stop_sequences:
         return content
@@ -882,7 +898,7 @@ class VLLMModel(Model):
     没有 generate_stream()（不支持流式输出）。
 
     Parameters:
-        model_id (`str`):
+           (`str`):
             HuggingFace 模型 ID 或本地路径，如：
               - "meta-llama/Llama-3-8B-Instruct"
               - "/path/to/local/model"
@@ -1035,26 +1051,43 @@ class VLLMModel(Model):
 
 
 class MLXModel(Model):
-    """A class to interact with models loaded using MLX on Apple silicon.
+    """Apple Silicon 本地推理模型 —— 在 Mac 的 M 系列芯片上跑 LLM。
 
-    > [!TIP]
-    > You must have `mlx-lm` installed on your machine. Please run `pip install 'smolagents[mlx-lm]'` if it's not the case.
+    MLX 是什么？
+        Apple 开发的机器学习框架，专门为 M1/M2/M3/M4 芯片优化。
+        mlx-lm 是基于 MLX 的 LLM 推理库，类似于 vLLM 之于 NVIDIA GPU。
+
+    和 VLLMModel 的对比：
+        VLLMModel → NVIDIA GPU（CUDA），用 vLLM 引擎
+        MLXModel  → Apple Silicon（统一内存），用 mlx-lm 引擎
+
+    generate() 流程和 VLLMModel 几乎一样：
+        prepare_kwargs → 拆参数 → apply_chat_template → 推理 → ChatMessage
+
+    两个小区别：
+        1. apply_chat_template 返回 token ID 列表（不是文本字符串），
+           因为 mlx_lm.stream_generate 接受 token ID 作为输入
+        2. 推理用 stream_generate（逐 token 流式生成），内部循环拼接文本，
+           遇到 stop 词就 break。虽然内部是流式的，但对外返回完整 ChatMessage
+
+    不支持：
+        - 视觉模型（_is_vlm = False）
+        - 结构化输出（response_format）
+        - generate_stream()（没有对外的流式接口）
 
     Parameters:
-        model_id (str):
-            The Hugging Face model ID to be used for inference. This can be a path or model identifier from the Hugging Face model hub.
-        tool_name_key (str):
-            The key, which can usually be found in the model's chat template, for retrieving a tool name.
-        tool_arguments_key (str):
-            The key, which can usually be found in the model's chat template, for retrieving tool arguments.
-        trust_remote_code (bool, default `False`):
-            Some models on the Hub require running remote code: for this model, you would have to set this flag to True.
-        load_kwargs (dict[str, Any], *optional*):
-            Additional keyword arguments to pass to the `mlx.lm.load` method when loading the model and tokenizer.
-        apply_chat_template_kwargs (dict, *optional*):
-            Additional keyword arguments to pass to the `apply_chat_template` method of the tokenizer.
+        model_id (`str`):
+            HuggingFace 模型 ID，通常用 MLX 社区的量化版本：
+              - "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit"
+              - "mlx-community/Llama-3-8B-Instruct-4bit"
+        trust_remote_code (`bool`, default `False`):
+            是否信任模型仓库中的远程代码。某些模型需要设为 True。
+        load_kwargs (`dict[str, Any]`, *optional*):
+            传给 mlx_lm.load() 的额外参数，控制模型加载方式。
+        apply_chat_template_kwargs (`dict`, *optional*):
+            传给 tokenizer.apply_chat_template() 的额外参数。
         **kwargs:
-            Additional keyword arguments to forward to the underlying MLX model stream_generate call, for instance `max_tokens`.
+            传给 mlx_lm.stream_generate() 的额外参数，如 max_tokens。
 
     Example:
     ```python
@@ -1089,15 +1122,18 @@ class MLXModel(Model):
         import mlx_lm
 
         self.load_kwargs = load_kwargs or {}
+        # 把 trust_remote_code 塞进 tokenizer 配置
         self.load_kwargs.setdefault("tokenizer_config", {}).setdefault("trust_remote_code", trust_remote_code)
         self.apply_chat_template_kwargs = apply_chat_template_kwargs or {}
+        # 默认加上 assistant 开头标记（和 VLLMModel 的 add_generation_prompt=True 一样）
         self.apply_chat_template_kwargs.setdefault("add_generation_prompt", True)
-        # mlx-lm doesn't support vision models: flatten_messages_as_text=True
+        # mlx-lm 不支持视觉模型，所以固定 flatten_messages_as_text=True
         super().__init__(model_id=model_id, flatten_messages_as_text=True, **kwargs)
 
+        # 加载模型和分词器到 Apple Silicon 的统一内存（和 VLLMModel 的 LLM() 对应）
         self.model, self.tokenizer = mlx_lm.load(self.model_id, **self.load_kwargs)
         self.stream_generate = mlx_lm.stream_generate
-        self.is_vlm = False  # mlx-lm doesn't support vision models
+        self.is_vlm = False  # mlx-lm 不支持视觉模型
 
     def generate(
         self,
@@ -1107,73 +1143,95 @@ class MLXModel(Model):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> ChatMessage:
+        """本地推理生成，流程和 VLLMModel 类似但有两个区别：
+        1. apply_chat_template 返回 token ID（不是文本）
+        2. 用 stream_generate 逐 token 生成，内部循环拼接
+        """
         if response_format is not None:
             raise ValueError("MLX does not support structured outputs.")
+        # === 第1步：组装参数（OpenAI 格式） ===
         completion_kwargs = self._prepare_completion_kwargs(
             messages=messages,
             stop_sequences=stop_sequences,
             tools_to_call_from=tools_to_call_from,
             **kwargs,
         )
+        # === 第2步：拆参数（和 VLLMModel 一样） ===
         messages = completion_kwargs.pop("messages")
         stops = completion_kwargs.pop("stop", [])
         tools = completion_kwargs.pop("tools", None)
         completion_kwargs.pop("tool_choice", None)
 
+        # === 第3步：apply_chat_template ===
+        # 注意：这里返回的是 token ID 列表（不是文本字符串）
+        # 因为 mlx_lm.stream_generate 接受 token ID 作为 prompt 输入
         prompt_ids = self.tokenizer.apply_chat_template(messages, tools=tools, **self.apply_chat_template_kwargs)
 
+        # === 第4步 + 第5步：流式推理 + 逐 token 拼接 ===
+        # 虽然内部是流式的，但对外返回完整结果（不是 yield）
         output_tokens = 0
         text = ""
         for response in self.stream_generate(self.model, self.tokenizer, prompt=prompt_ids, **completion_kwargs):
             output_tokens += 1
             text += response.text
+            # 检查是否遇到了停止词，遇到就截断并停止
             if any((stop_index := text.rfind(stop)) != -1 for stop in stops):
                 text = text[:stop_index]
                 break
         if stop_sequences is not None and not self.supports_stop_parameter:
             text = remove_content_after_stop_sequences(text, stop_sequences)
+        # === 第6步：包装为 ChatMessage ===
         return ChatMessage(
             role=MessageRole.ASSISTANT,
             content=text,
             raw={"out": text, "completion_kwargs": completion_kwargs},
             token_usage=TokenUsage(
-                input_tokens=len(prompt_ids),
-                output_tokens=output_tokens,
+                input_tokens=len(prompt_ids),       # 输入 token 数
+                output_tokens=output_tokens,        # 输出 token 数（循环计数）
             ),
         )
 
 
 class TransformersModel(Model):
-    """A class that uses Hugging Face's Transformers library for language model interaction.
+    """HuggingFace Transformers 本地推理模型 —— 最通用的本地模型。
 
-    This model allows you to load and use Hugging Face's models locally using the Transformers library. It supports features like stop sequences and grammar customization.
+    Transformers 是什么？
+        HuggingFace 的核心库，几乎所有 HuggingFace Hub 上的模型都能用它加载和推理。
+        支持 CPU 和 GPU，是最灵活的选择（但性能不如 vLLM 那么极致）。
 
-    > [!TIP]
-    > You must have `transformers` and `torch` installed on your machine. Please run `pip install 'smolagents[transformers]'` if it's not the case.
+    和其他本地模型的对比：
+        VLLMModel        → vLLM 引擎，专为高吞吐量优化，只支持 NVIDIA GPU
+        MLXModel         → mlx-lm 引擎，专为 Apple Silicon 优化
+        TransformersModel → Transformers，通用，CPU/GPU 都行，最灵活
+
+    三个独特之处：
+        1. 自动检测视觉模型：先尝试加载为视觉模型（AutoModelForImageTextToText），
+           失败了再当文本模型（AutoModelForCausalLM）加载
+        2. 自定义停止条件：Transformers 不直接支持字符串 stop，
+           需要用 StoppingCriteria 回调来实现
+        3. 支持 generate_stream()：用多线程 + TextIteratorStreamer 实现流式输出
 
     Parameters:
         model_id (`str`):
-            The Hugging Face model ID to be used for inference. This can be a path or model identifier from the Hugging Face model hub.
-            For example, `"Qwen/Qwen3-Next-80B-A3B-Thinking"`.
+            HuggingFace 模型 ID 或本地路径，如：
+              - "Qwen/Qwen3-Next-80B-A3B-Thinking"
+              - "meta-llama/Llama-3-8B-Instruct"
         device_map (`str`, *optional*):
-            The device_map to initialize your model with.
+            模型放在哪个设备上。默认自动检测：有 CUDA 用 GPU，没有用 CPU。
+            也可以传 "auto" 让 Transformers 自动分配多 GPU。
         torch_dtype (`str`, *optional*):
-            The torch_dtype to initialize your model with.
-        trust_remote_code (bool, default `False`):
-            Some models on the Hub require running remote code: for this model, you would have to set this flag to True.
+            模型精度，如 "float16", "bfloat16"。低精度省显存但可能损失精度。
+        trust_remote_code (`bool`, default `False`):
+            是否信任模型仓库中的远程代码。某些模型需要设为 True。
         model_kwargs (`dict[str, Any]`, *optional*):
-            Additional keyword arguments to pass to `AutoModel.from_pretrained` (like revision, model_args, config, etc.).
+            传给 AutoModel.from_pretrained() 的额外参数。
         max_new_tokens (`int`, default `4096`):
-            Maximum number of new tokens to generate, ignoring the number of tokens in the prompt.
+            最大生成 token 数。
         max_tokens (`int`, *optional*):
-            Alias for `max_new_tokens`. If provided, this value takes precedence.
-        apply_chat_template_kwargs (dict, *optional*):
-            Additional keyword arguments to pass to the `apply_chat_template` method of the tokenizer.
-        **kwargs:
-            Additional keyword arguments to forward to the underlying Transformers model generate call, such as `device`.
-    Raises:
-        ValueError:
-            If the model name is not provided.
+            max_new_tokens 的别名，传了会覆盖 max_new_tokens。
+        apply_chat_template_kwargs (`dict`, *optional*):
+            传给 tokenizer.apply_chat_template() 的额外参数。
+        **kwargs: 传给 model.generate() 的额外参数。
 
     Example:
     ```python
@@ -1215,6 +1273,7 @@ class TransformersModel(Model):
                 "Please install 'transformers' extra to use 'TransformersModel': `pip install 'smolagents[transformers]'`"
             )
 
+        # model_id 在 2.0 版本将变为必填参数
         if not model_id:
             warnings.warn(
                 "The 'model_id' parameter will be required in version 2.0.0. "
@@ -1224,14 +1283,18 @@ class TransformersModel(Model):
             )
             model_id = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
+        # max_tokens 是 max_new_tokens 的别名，传了就覆盖
         max_new_tokens = max_tokens if max_tokens is not None else max_new_tokens
 
+        # 自动检测设备：有 CUDA 用 GPU，没有用 CPU
         if device_map is None:
             device_map = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using device: {device_map}")
         self._is_vlm = False
         self.model_kwargs = model_kwargs or {}
         self.apply_chat_template_kwargs = apply_chat_template_kwargs or {}
+        # === 自动检测视觉模型 ===
+        # 先尝试加载为视觉模型（能处理图片+文字）
         try:
             self.model = AutoModelForImageTextToText.from_pretrained(
                 model_id,
@@ -1240,11 +1303,14 @@ class TransformersModel(Model):
                 trust_remote_code=trust_remote_code,
                 **self.model_kwargs,
             )
+            # 视觉模型用 processor（能同时处理图片和文字）
             self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-            self._is_vlm = True
+            self._is_vlm = True    # 标记为视觉模型
+            # 流式输出用的 streamer（推理线程写入，主线程读取）
             self.streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)  # type: ignore
 
         except ValueError as e:
+            # 加载视觉模型失败 → 当普通文本模型加载
             if "Unrecognized configuration class" in str(e):
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_id,
@@ -1253,6 +1319,7 @@ class TransformersModel(Model):
                     trust_remote_code=trust_remote_code,
                     **self.model_kwargs,
                 )
+                # 文本模型用 tokenizer（只处理文字）
                 self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
                 self.streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)  # type: ignore
             else:
@@ -1264,23 +1331,34 @@ class TransformersModel(Model):
         )
 
     def make_stopping_criteria(self, stop_sequences: list[str], tokenizer) -> "StoppingCriteriaList":
+        """创建自定义停止条件。
+
+        Transformers 的 model.generate() 不直接支持字符串 stop 参数
+        （不像 OpenAI/vLLM 那样传 stop=["END"] 就行）。
+        需要用 StoppingCriteria 回调：每生成一个 token 就检查"要不要停"。
+
+        原理：把每个新 token 解码成文字，拼到累积字符串上，
+        检查是否以某个停止词结尾。如果是，返回 True 停止生成。
+        """
         from transformers import StoppingCriteria, StoppingCriteriaList
 
         class StopOnStrings(StoppingCriteria):
             def __init__(self, stop_strings: list[str], tokenizer):
                 self.stop_strings = stop_strings
                 self.tokenizer = tokenizer
-                self.stream = ""
+                self.stream = ""  # 累积已生成的文字
 
             def reset(self):
                 self.stream = ""
 
             def __call__(self, input_ids, scores, **kwargs):
+                # 把最新生成的 token 解码成文字
                 generated = self.tokenizer.decode(input_ids[0][-1], skip_special_tokens=True)
                 self.stream += generated
+                # 检查累积文字是否以停止词结尾
                 if any([self.stream.endswith(stop_string) for stop_string in self.stop_strings]):
-                    return True
-                return False
+                    return True   # 停止生成
+                return False      # 继续生成
 
         return StoppingCriteriaList([StopOnStrings(stop_sequences, tokenizer)])
 
@@ -1291,18 +1369,31 @@ class TransformersModel(Model):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
+        """把 OpenAI 格式参数翻译成 Transformers model.generate() 的参数。
+
+        和 VLLMModel 的"拆参数"逻辑类似，但多了几步：
+        1. 调父类 _prepare_completion_kwargs 拿到 OpenAI 格式
+        2. 拆出 messages、stop、tools
+        3. apply_chat_template → 返回 PyTorch tensor（不是文本）
+        4. 把 tensor 移到模型所在设备（GPU/CPU）
+        5. 构建 StoppingCriteria
+        6. 打包返回
+        """
+        # 第1步：父类方法组装 OpenAI 格式参数
         completion_kwargs = self._prepare_completion_kwargs(
             messages=messages,
             stop_sequences=stop_sequences,
             tools_to_call_from=tools_to_call_from,
-            tool_choice=None,
+            tool_choice=None,  # Transformers 不支持 tool_choice
             **kwargs,
         )
 
+        # 第2步：拆参数
         messages = completion_kwargs.pop("messages")
         stop_sequences = completion_kwargs.pop("stop", None)
         tools = completion_kwargs.pop("tools", None)
 
+        # 解析 max_new_tokens：从多个来源中取值（优先级从高到低）
         max_new_tokens = (
             kwargs.get("max_new_tokens")
             or kwargs.get("max_tokens")
@@ -1310,28 +1401,35 @@ class TransformersModel(Model):
             or self.kwargs.get("max_tokens")
             or 1024
         )
+        # 第3步：apply_chat_template → PyTorch tensor
+        # 注意和 VLLMModel 的区别：
+        #   VLLMModel: tokenize=False → 返回文本字符串
+        #   TransformersModel: return_tensors="pt" → 返回 PyTorch tensor
         prompt_tensor = (self.processor if hasattr(self, "processor") else self.tokenizer).apply_chat_template(
             messages,
             tools=tools,
-            return_tensors="pt",
+            return_tensors="pt",             # 返回 PyTorch tensor
             add_generation_prompt=True,
-            tokenize=True,
+            tokenize=True,                   # 直接 tokenize
             return_dict=True,
             **self.apply_chat_template_kwargs,
         )
+        # 第4步：把 tensor 移到模型所在设备（GPU/CPU）
         prompt_tensor = prompt_tensor.to(self.model.device)  # type: ignore
         if hasattr(prompt_tensor, "input_ids"):
             prompt_tensor = prompt_tensor["input_ids"]
 
+        # 第5步：构建停止条件，通过hassttr(self,"processor")判断是不是文本模型
         model_tokenizer = self.processor.tokenizer if hasattr(self, "processor") else self.tokenizer
         stopping_criteria = (
             self.make_stopping_criteria(stop_sequences, tokenizer=model_tokenizer) if stop_sequences else None
         )
         completion_kwargs["max_new_tokens"] = max_new_tokens
+        # 第6步：打包返回 Transformers model.generate() 需要的参数
         return dict(
-            inputs=prompt_tensor,
-            use_cache=True,
-            stopping_criteria=stopping_criteria,
+            inputs=prompt_tensor,                    # 输入 token tensor
+            use_cache=True,                          # 启用 KV Cache 加速
+            stopping_criteria=stopping_criteria,     # 自定义停止条件
             **completion_kwargs,
         )
 
@@ -1343,19 +1441,31 @@ class TransformersModel(Model):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> ChatMessage:
+        """非流式生成。流程：
+        1. _prepare_completion_args() → 组装 Transformers 格式参数
+        2. model.generate() → 本地推理，返回完整的 token ID 序列
+        3. decode → 把 token ID 转回文字
+        4. 包装为 ChatMessage
+        """
         if response_format is not None:
             raise ValueError("Transformers does not support structured outputs, use VLLMModel for this.")
+        # === 第1步：组装参数 ===
         generation_kwargs = self._prepare_completion_args(
             messages=messages,
             stop_sequences=stop_sequences,
             tools_to_call_from=tools_to_call_from,
             **kwargs,
         )
+        # 记录输入 token 数（用于统计）
         count_prompt_tokens = generation_kwargs["inputs"].shape[1]  # type: ignore
+        # === 第2步：本地推理 ===
         out = self.model.generate(
             **generation_kwargs,
         )
+        # out 包含输入+输出的完整 token 序列，需要截掉输入部分
         generated_tokens = out[0, count_prompt_tokens:]
+        # === 第3步：decode → 文字 ===
+        # 视觉模型用 processor.decode，文本模型用 tokenizer.decode
         if hasattr(self, "processor"):
             output_text = self.processor.decode(generated_tokens, skip_special_tokens=True)
         else:
@@ -1363,6 +1473,7 @@ class TransformersModel(Model):
 
         if stop_sequences is not None:
             output_text = remove_content_after_stop_sequences(output_text, stop_sequences)
+        # === 第4步：包装为 ChatMessage ===
         return ChatMessage(
             role=MessageRole.ASSISTANT,
             content=output_text,
@@ -1384,6 +1495,14 @@ class TransformersModel(Model):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> Generator[ChatMessageStreamDelta]:
+        """流式生成 —— 用多线程 + TextIteratorStreamer 实现。
+
+        原理：
+        - 推理在子线程中运行（model.generate 是阻塞的）
+        - 子线程每生成一个 token 就写入 streamer
+        - 主线程从 streamer 中逐 token 读取并 yield
+        - streamer 就像一个管道，连接推理线程和主线程
+        """
         if response_format is not None:
             raise ValueError("Transformers does not support structured outputs, use VLLMModel for this.")
         generation_kwargs = self._prepare_completion_args(
@@ -1394,19 +1513,20 @@ class TransformersModel(Model):
             **kwargs,
         )
 
-        # Get prompt token count once
+        # 记录输入 token 数
         count_prompt_tokens = generation_kwargs["inputs"].shape[1]  # type: ignore
 
-        # Start generation in a separate thread
+        # 在子线程中启动推理（因为 model.generate 是阻塞的）
+        # streamer 参数让推理过程把每个 token 写入 streamer
         thread = Thread(target=self.model.generate, kwargs={"streamer": self.streamer, **generation_kwargs})
         thread.start()
 
-        # Process streaming output
+        # 主线程从 streamer 中逐 token 读取并 yield
         is_first_token = True
         count_generated_tokens = 0
         for new_text in self.streamer:
             count_generated_tokens += 1
-            # Only include input tokens in the first yielded token
+            # 只在第一个 token 时报告输入 token 数
             input_tokens = count_prompt_tokens if is_first_token else 0
             is_first_token = False
             yield ChatMessageStreamDelta(
@@ -1415,9 +1535,10 @@ class TransformersModel(Model):
                 token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=1),
             )
             count_prompt_tokens = 0
+        # 等待推理线程结束
         thread.join()
 
-        # Update final output token count
+        # 记录总输出 token 数（供外部统计用）
         self._last_output_token_count = count_generated_tokens
 
 
@@ -1517,7 +1638,15 @@ class ApiModel(Model):
 
 
 def is_rate_limit_error(exception: BaseException) -> bool:
-    """Check if the exception is a rate limit error."""
+    """判断一个异常是否是速率限制错误（429 Too Many Requests）。
+
+    被 ApiModel 的 retryer 用作 retry_predicate：
+      - 返回 True → 值得重试（等一下就好了）
+      - 返回 False → 不重试（比如认证错误，重试也没用）
+
+    做法：把异常信息转成字符串，看里面有没有关键词。
+    不管是哪家 API 的错误对象，只要包含这些词就算速率限制错误。
+    """
     error_str = str(exception).lower()
     return (
         "429" in error_str
@@ -2555,8 +2684,10 @@ AmazonBedrockServerModel = AmazonBedrockModel
 
 # Model Registry for secure deserialization
 # This registry maps model class names to their actual classes.
-# Only classes listed here can be instantiated during deserialization (from_dict).
-# This prevents arbitrary code execution via importlib-based dynamic loading.
+# 模型注册表：用于安全的反序列化（从 JSON 恢复模型对象）
+# 序列化时：OpenAIModel 类 → "OpenAIModel" 字符串 → 存进 JSON
+# 反序列化时：JSON 读出 "OpenAIModel" → 查此表 → 拿到 OpenAIModel 类 → 创建实例
+# 只有此表中列出的类才允许被创建，防止恶意 JSON 执行任意代码
 MODEL_REGISTRY = {
     "VLLMModel": VLLMModel,
     "MLXModel": MLXModel,
