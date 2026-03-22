@@ -398,15 +398,38 @@ class Tool(BaseTool):
         """
         Overwrite this method here for any operation that is expensive and needs to be executed before you start using
         your tool. Such as loading a big model.
+
+        懒操作用的函数，把比较重的操作放到这里去实现，而不是在类init中实现。
         """
         self.is_initialized = True
 
     def to_code_prompt(self) -> str:
-        """为 CodeAgent 生成工具的伪代码描述（出现在系统提示词中）。
-        LLM 看到的是类似 Python 函数签名的描述，这样它生成的代码调用方式更自然：
-            def get_weather(location: string, celsius: boolean) -> string:
-                \"\"\"获取天气。Args: location: ..., celsius: ...\"\"\"
+        """为 CodeAgent 生成 Python 函数签名风格的工具描述，嵌入到系统提示词中。
+
+        CodeAgent 通过生成 Python 代码来调用工具，所以这里把工具描述成一个 Python 函数，
+        让 LLM 自然地生成 `result = tool_name(arg1, arg2)` 这样的调用代码。
+
+        生成的格式示例（普通工具）：
+            def web_search(query: string) -> string:
+                \"\"\"Performs a web search...
+                Args:
+                    query: The search query to perform.
+                \"\"\"
+
+        生成的格式示例（有 output_schema 的结构化输出工具）：
+            def get_info(query: string) -> dict:
+                \"\"\"获取信息...
+                Important: This tool returns structured output! ...
+                Args:
+                    query: ...
+                Returns:
+                    dict (structured output): ... JSON schema ...
+                \"\"\"
+
+        Returns:
+            str: Python 伪代码格式的工具描述
         """
+        # 拼接参数签名，如 "query: string, top_k: integer"
         args_signature = ", ".join(f"{arg_name}: {arg_schema['type']}" for arg_name, arg_schema in self.inputs.items())
 
         # 若工具有结构化输出 Schema，返回类型标注为 dict（提示 LLM 用字段访问方式）
@@ -415,11 +438,11 @@ class Tool(BaseTool):
         tool_signature = f"({args_signature}) -> {output_type}"
         tool_doc = self.description
 
-        # Add an important note for smaller models (e.g. Mistral Small, Gemma 3, etc.) to properly handle structured output.
+        # 对于结构化输出工具，追加提示语，帮助小模型正确处理 dict 返回值
         if has_schema:
             tool_doc += "\n\nImportant: This tool returns structured output! Use the JSON schema below to directly access fields like result['field_name']. NO print() statements needed to inspect the output!"
 
-        # Add arguments documentation
+        # 拼接参数文档（Args 段落）
         if self.inputs:
             args_descriptions = "\n".join(
                 f"{arg_name}: {arg_schema['description']}" for arg_name, arg_schema in self.inputs.items()
@@ -427,27 +450,53 @@ class Tool(BaseTool):
             args_doc = f"Args:\n{textwrap.indent(args_descriptions, '    ')}"
             tool_doc += f"\n\n{args_doc}"
 
-        # Add returns documentation with output schema if it exists
+        # 若有结构化输出，追加 Returns 段落和完整的 JSON Schema
         if has_schema:
             formatted_schema = json.dumps(self.output_schema, indent=4)
             indented_schema = textwrap.indent(formatted_schema, "        ")
             returns_doc = f"\nReturns:\n    dict (structured output): This tool ALWAYS returns a dictionary that strictly adheres to the following JSON schema:\n{indented_schema}"
             tool_doc += f"\n{returns_doc}"
 
+        # 包装成 Python docstring 格式
         tool_doc = f'"""{tool_doc}\n"""'
         return f"def {self.name}{tool_signature}:\n{textwrap.indent(tool_doc, '    ')}"
 
     def to_tool_calling_prompt(self) -> str:
+        """为 ToolCallingAgent 生成纯文本风格的工具描述，嵌入到系统提示词中。
+
+        ToolCallingAgent 通过生成 JSON 来调用工具（而非 Python 代码），
+        所以这里用更简洁的纯文本格式描述工具，让 LLM 生成如下调用：
+            {"tool": "web_search", "arguments": {"query": "Python tutorial"}}
+
+        生成的格式示例：
+            web_search: Performs a web search...
+                Takes inputs: {"query": {"type": "string", "description": "..."}}
+                Returns an output of type: string
+
+        Returns:
+            str: 纯文本格式的工具描述
+        """
         return f"{self.name}: {self.description}\n    Takes inputs: {self.inputs}\n    Returns an output of type: {self.output_type}"
 
     def to_dict(self) -> dict:
-        """Returns a dictionary representing the tool"""
+        """将工具序列化为字典，包含完整源代码，用于 save()/push_to_hub()/from_dict() 等场景。
+
+        根据工具的创建方式走两条路径：
+        - @tool 装饰器创建的（SimpleTool）：从原函数源码反向生成完整的 Tool 子类代码
+        - 继承 Tool 类创建的：直接用 instance_to_source() 提取整个类的源码
+
+        Returns:
+            dict: {"name": 工具名, "code": 完整类源码, "requirements": 依赖列表, "output_schema": 可选}
+        """
         class_name = self.__class__.__name__
         if type(self).__name__ == "SimpleTool":
-            # Check that imports are self-contained
+            # ===== 路径一：@tool 装饰器创建的工具 =====
+            # 这种工具只有一个函数，需要反向生成完整的类代码
+
+            # 第一步：拿到原函数源码，用 AST 检查是否"自包含"（不依赖外部变量）
+            # 如果函数里引用了外部全局变量，序列化后别人那边没有这个变量就会报错
             source_code = get_source(self.forward).replace("@tool", "")
             forward_node = ast.parse(source_code)
-            # If tool was created using '@tool' decorator, it has only a forward pass, so it's simpler to just get its code
             method_checker = MethodChecker(set())
             method_checker.visit(forward_node)
 
@@ -455,6 +504,7 @@ class Tool(BaseTool):
                 errors = [f"- {error}" for error in method_checker.errors]
                 raise (ValueError(f"SimpleTool validation failed for {self.name}:\n" + "\n".join(errors)))
 
+            # 第二步：手动拼出完整的 Tool 子类代码（类定义 + 类属性）
             forward_source_code = get_source(self.forward)
             tool_code = textwrap.dedent(
                 f"""
@@ -469,7 +519,6 @@ class Tool(BaseTool):
             """
             ).strip()
 
-            # Add output_schema if it exists
             if hasattr(self, "output_schema") and self.output_schema is not None:
                 tool_code += f"\n                output_schema = {repr(self.output_schema)}"
             import re
@@ -486,12 +535,18 @@ class Tool(BaseTool):
 
                 return re.sub(pattern, replacement, source_code)
 
+            # 第三步：把原函数改造成类的 forward 方法
+            # - 函数名从原名（如 get_weather）改成 forward
+            # - 加上 self 参数（原函数是普通函数，没有 self）
+            # - 去掉 @tool 装饰器
+            # - 缩进 4 格放进类体内
             forward_source_code = forward_source_code.replace(self.name, "forward")
             forward_source_code = add_self_argument(forward_source_code)
             forward_source_code = forward_source_code.replace("@tool", "").strip()
             tool_code += "\n\n" + textwrap.indent(forward_source_code, "    ")
 
-        else:  # If the tool was not created by the @tool decorator, it was made by subclassing Tool
+        else:  # ===== 路径二：继承 Tool 类创建的工具 =====
+            # 三种包装类依赖外部运行时对象，无法序列化
             if type(self).__name__ in [
                 "SpaceToolWrapper",
                 "LangChainToolWrapper",
@@ -502,14 +557,14 @@ class Tool(BaseTool):
                 )
 
             validate_tool_attributes(self.__class__)
-
+            # 直接提取整个类的源码
             tool_code = "from typing import Any, Optional\n" + instance_to_source(self, base_cls=Tool)
 
+        # 从生成的代码中提取第三方依赖（排除标准库），smolagents 始终作为依赖
         requirements = {el for el in get_imports(tool_code) if el not in sys.stdlib_module_names} | {"smolagents"}
 
         tool_dict = {"name": self.name, "code": tool_code, "requirements": sorted(requirements)}
 
-        # Add output_schema if it exists
         if hasattr(self, "output_schema") and self.output_schema is not None:
             tool_dict["output_schema"] = self.output_schema
 
@@ -517,56 +572,60 @@ class Tool(BaseTool):
 
     @classmethod
     def from_dict(cls, tool_dict: dict[str, Any], **kwargs) -> "Tool":
-        """
-        Create tool from a dictionary representation.
+        """从字典反序列化出 Tool 实例（to_dict 的逆操作）。
+
+        内部调用 from_code()，用 exec 执行字典中的源代码字符串，还原出 Tool 对象。
 
         Args:
-            tool_dict (`dict[str, Any]`): Dictionary representation of the tool.
-            **kwargs: Additional keyword arguments to pass to the tool's constructor.
+            tool_dict: to_dict() 生成的字典，必须包含 "code" 键
+            **kwargs: 传递给 Tool 子类构造函数的额外参数
 
         Returns:
-            `Tool`: Tool object.
+            还原出的 Tool 实例
         """
         if "code" not in tool_dict:
             raise ValueError("Tool dictionary must contain 'code' key with the tool source code")
 
         tool = cls.from_code(tool_dict["code"], **kwargs)
 
-        # Set output_schema if it exists in the dictionary
+        # 补上 output_schema（如果字典中有的话）
         if "output_schema" in tool_dict:
             tool.output_schema = tool_dict["output_schema"]
 
         return tool
 
     def save(self, output_dir: str | Path, tool_file_name: str = "tool", make_gradio_app: bool = True):
-        """
-        Saves the relevant code files for your tool so it can be pushed to the Hub. This will copy the code of your
-        tool in `output_dir` as well as autogenerate:
+        """将工具保存到本地文件夹，生成可直接上传到 HuggingFace Space 的文件。
 
-        - a `{tool_file_name}.py` file containing the logic for your tool.
-        If you pass `make_gradio_app=True`, this will also write:
-        - an `app.py` file providing a UI for your tool when it is exported to a Space with `tool.push_to_hub()`
-        - a `requirements.txt` containing the names of the modules used by your tool (as detected when inspecting its
-          code)
+        生成的文件结构：
+            output_dir/
+            ├── {tool_file_name}.py   # 工具的完整类代码（来自 to_dict()["code"]）
+            ├── app.py                # Gradio UI 启动脚本（make_gradio_app=True 时生成）
+            └── requirements.txt      # 第三方依赖列表（make_gradio_app=True 时生成）
+
+        与 push_to_hub() 的关系：两者生成的文件内容完全一样，
+        save() 写到本地磁盘，push_to_hub() 直接上传到 Hub。
 
         Args:
-            output_dir (`str` or `Path`): The folder in which you want to save your tool.
-            tool_file_name (`str`, *optional*): The file name in which you want to save your tool.
-            make_gradio_app (`bool`, *optional*, defaults to True): Whether to also export a `requirements.txt` file and Gradio UI.
+            output_dir: 保存目录路径
+            tool_file_name: 工具代码文件名（不含 .py 后缀）
+            make_gradio_app: 是否同时生成 app.py 和 requirements.txt
         """
-        # Ensure output directory exists
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        # Save tool file
+        # 保存工具源码
         self._write_file(output_path / f"{tool_file_name}.py", self._get_tool_code())
         if make_gradio_app:
-            #  Save app file
+            # 保存 Gradio UI 启动脚本
             self._write_file(output_path / "app.py", self._get_gradio_app_code(tool_module_name=tool_file_name))
-            # Save requirements file
+            # 保存依赖列表
             self._write_file(output_path / "requirements.txt", self._get_requirements())
 
     def _write_file(self, file_path: Path, content: str) -> None:
-        """Writes content to a file with UTF-8 encoding."""
+        """写文件的封装方法，统一使用 UTF-8 编码。
+
+        封装的好处：save() 里写三个文件时复用，子类也可以重写来改变写文件行为（如加日志）。
+        """
         file_path.write_text(content, encoding="utf-8")
 
     def push_to_hub(
@@ -577,28 +636,28 @@ class Tool(BaseTool):
         token: bool | str | None = None,
         create_pr: bool = False,
     ) -> str:
-        """
-        Upload the tool to the Hub.
+        """将工具上传到 HuggingFace Hub，作为一个 Gradio Space。
+
+        save() 的线上版：生成的文件内容一样（tool.py + app.py + requirements.txt），
+        但不写本地磁盘，直接上传到 Hub。上传后别人可以通过 Tool.from_hub(repo_id) 加载。
+
+        三步流程：
+        1. _initialize_hub_repo(): 在 Hub 上创建 Space 仓库，打上 smolagents 标签
+        2. _prepare_hub_files():   生成三个文件的内容（tool.py/app.py/requirements.txt）
+        3. create_commit():        提交文件到仓库（相当于 git add + commit + push）
 
         Parameters:
-            repo_id (`str`):
-                The name of the repository you want to push your tool to. It should contain your organization name when
-                pushing to a given organization.
-            commit_message (`str`, *optional*, defaults to `"Upload tool"`):
-                Message to commit while pushing.
-            private (`bool`, *optional*):
-                Whether to make the repo private. If `None` (default), the repo will be public unless the organization's default is private. This value is ignored if the repo already exists.
-            token (`bool` or `str`, *optional*):
-                The token to use as HTTP bearer authorization for remote files. If unset, will use the token generated
-                when running `huggingface-cli login` (stored in `~/.huggingface`).
-            create_pr (`bool`, *optional*, defaults to `False`):
-                Whether to create a PR with the uploaded files or directly commit.
+            repo_id: Hub 上的仓库 ID（如 "your_name/your_tool"）
+            commit_message: 提交信息
+            private: 是否私有仓库
+            token: HuggingFace 认证 token
+            create_pr: 是否创建 PR 而非直接提交
         """
-        # Initialize repository
+        # 第一步：创建/初始化 Hub 仓库
         repo_id = self._initialize_hub_repo(repo_id, token, private)
-        # Prepare files for commit
+        # 第二步：准备要上传的文件
         additions = self._prepare_hub_files()
-        # Create commit
+        # 第三步：提交到 Hub
         return create_commit(
             repo_id=repo_id,
             operations=additions,
@@ -610,32 +669,29 @@ class Tool(BaseTool):
 
     @staticmethod
     def _initialize_hub_repo(repo_id: str, token: bool | str | None, private: bool | None) -> str:
-        """Initialize repository on Hugging Face Hub."""
+        """在 HuggingFace Hub 上创建/初始化 Space 仓库，并打上 smolagents 标签。"""
         repo_url = create_repo(
             repo_id=repo_id,
             token=token,
             private=private,
-            exist_ok=True,
-            repo_type="space",
-            space_sdk="gradio",
+            exist_ok=True,       # 仓库已存在时不报错
+            repo_type="space",   # 创建为 Space（而非 model 或 dataset）
+            space_sdk="gradio",  # 使用 Gradio SDK
         )
         metadata_update(repo_url.repo_id, {"tags": ["smolagents", "tool"]}, repo_type="space", token=token)
         return repo_url.repo_id
 
     def _prepare_hub_files(self) -> list:
-        """Prepare files for Hub commit."""
+        """准备要上传到 Hub 的三个文件，返回 CommitOperationAdd 列表。"""
         additions = [
-            # Add tool code
             CommitOperationAdd(
                 path_in_repo="tool.py",
                 path_or_fileobj=self._get_tool_code().encode(),
             ),
-            # Add Gradio app
             CommitOperationAdd(
                 path_in_repo="app.py",
                 path_or_fileobj=self._get_gradio_app_code().encode(),
             ),
-            # Add requirements
             CommitOperationAdd(
                 path_in_repo="requirements.txt",
                 path_or_fileobj=self._get_requirements().encode(),
@@ -644,11 +700,11 @@ class Tool(BaseTool):
         return additions
 
     def _get_tool_code(self) -> str:
-        """Get the tool's code."""
+        """获取工具的完整类源码（来自 to_dict()["code"]）。"""
         return self.to_dict()["code"]
 
     def _get_gradio_app_code(self, tool_module_name: str = "tool") -> str:
-        """Get the Gradio app code."""
+        """生成 Gradio UI 启动脚本代码，导入工具类并启动演示页面。"""
         class_name = self.__class__.__name__
         return textwrap.dedent(
             f"""\
@@ -661,7 +717,7 @@ class Tool(BaseTool):
         )
 
     def _get_requirements(self) -> str:
-        """Get the requirements."""
+        """获取工具的第三方依赖列表（每行一个包名）。"""
         return "\n".join(self.to_dict()["requirements"])
 
     @classmethod
