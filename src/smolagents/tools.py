@@ -221,17 +221,53 @@ class Tool(BaseTool):
         self.is_initialized = False
 
     def __init_subclass__(cls, **kwargs):
+        """Python 类创建钩子：每当有新类继承 Tool 时，自动被 Python 解释器调用。
+
+        作用：通过 validate_after_init() 将子类的 __init__ 替换为"带验证的版本"，
+        使得子类实例化后自动执行 validate_arguments()，无需开发者手动调用。
+
+        触发时机：类定义时（不是实例化时）。例如：
+            class MyTool(Tool):  # ← 这一行就会触发 Tool.__init_subclass__(MyTool)
+                ...
+
+        继承链也会生效：
+            class A(Tool): ...   # 触发
+            class B(A): ...      # 也触发（沿继承链向上找到 Tool 的这个方法）
+
+        Args:
+            cls: 被创建的子类本身（由 Python 自动传入，不是实例）
+            **kwargs: 传递给 super().__init_subclass__ 的关键字参数
+        """
         super().__init_subclass__(**kwargs)
         validate_after_init(cls)
 
     def validate_arguments(self):
+        """验证工具定义的完整性和正确性。
+
+        本方法通过 validate_after_init 装饰器在每个 Tool 子类实例化后自动调用，
+        确保工具在使用前就暴露定义错误，而不是等到 Agent 运行时才出问题。
+
+        验证分为五个阶段：
+        1. 必需类属性检查（name/description/inputs/output_type 是否存在且类型正确）
+        2. 工具名合法性检查（必须是合法的 Python 标识符，不能是保留字）
+        3. inputs 结构检查（每个参数必须有 type 和 description，type 必须在 AUTHORIZED_TYPES 中）
+        4. output_type 检查（必须在 AUTHORIZED_TYPES 中）
+        5. forward() 签名一致性检查（参数名必须和 inputs 的 key 完全一致，nullable 也要对应）
+
+        Raises:
+            TypeError: 属性类型不匹配，或 inputs 中 type 字段格式错误
+            ValueError: inputs 中使用了不在 AUTHORIZED_TYPES 中的类型
+            Exception: name 不是合法标识符，或 forward() 签名与 inputs 不一致
+            AssertionError: inputs 结构缺少必需字段，或 output_type 不合法
+        """
+        # ===== 第一阶段：验证四个必需的类属性是否存在且类型正确 =====
+        # 这四个属性是 Tool 的"身份证"，缺一不可
         required_attributes = {
             "description": str,
             "name": str,
             "inputs": dict,
             "output_type": str,
         }
-        # Validate class attributes
         for attr, expected_type in required_attributes.items():
             attr_value = getattr(self, attr, None)
             if attr_value is None:
@@ -241,28 +277,31 @@ class Tool(BaseTool):
                     f"Attribute {attr} should have type {expected_type.__name__}, got {type(attr_value)} instead."
                 )
 
-        # Validate optional output_schema attribute
+        # 验证可选的 output_schema 属性（用于结构化输出，不是必须的）
         output_schema = getattr(self, "output_schema", None)
         if output_schema is not None and not isinstance(output_schema, dict):
             raise TypeError(f"Attribute output_schema should have type dict, got {type(output_schema)} instead.")
 
-        # - Validate name
+        # ===== 第二阶段：验证工具名是否是合法的 Python 标识符 =====
+        # 因为 CodeAgent 会生成 `tool_name(args)` 这样的代码，name 必须是合法标识符
+        # 例如 "get_weather" ✓, "get-weather" ✗, "class" ✗（保留字）
         if not is_valid_name(self.name):
             raise Exception(
                 f"Invalid Tool name '{self.name}': must be a valid Python identifier and not a reserved keyword"
             )
-        # Validate inputs
+
+        # ===== 第三阶段：验证 inputs 字典的结构和类型 =====
+        # 每个参数必须是 {"type": "...", "description": "..."} 格式
         for input_name, input_content in self.inputs.items():
             assert isinstance(input_content, dict), f"Input '{input_name}' should be a dictionary."
             assert "type" in input_content and "description" in input_content, (
                 f"Input '{input_name}' should have keys 'type' and 'description', has only {list(input_content.keys())}."
             )
-            # Get input_types as a list, whether from a string or list
+            # type 可以是单个字符串 "string"，也可以是列表 ["string", "null"]（联合类型）
             if isinstance(input_content["type"], str):
                 input_types = [input_content["type"]]
             elif isinstance(input_content["type"], list):
                 input_types = input_content["type"]
-                # Check if all elements are strings
                 if not all(isinstance(t, str) for t in input_types):
                     raise TypeError(
                         f"Input '{input_name}': when type is a list, all elements must be strings, got {input_content['type']}"
@@ -271,18 +310,23 @@ class Tool(BaseTool):
                 raise TypeError(
                     f"Input '{input_name}': type must be a string or list of strings, got {type(input_content['type']).__name__}"
                 )
-            # Check all types are authorized
+            # 确保所有类型都在白名单中（AUTHORIZED_TYPES: string, boolean, integer, number, image, audio, array, object, any, null）
             invalid_types = [t for t in input_types if t not in AUTHORIZED_TYPES]
             if invalid_types:
                 raise ValueError(f"Input '{input_name}': types {invalid_types} must be one of {AUTHORIZED_TYPES}")
-        # Validate output type
+
+        # ===== 第四阶段：验证 output_type 是否在白名单中 =====
         assert getattr(self, "output_type", None) in AUTHORIZED_TYPES
 
-        # Validate forward function signature, except for Tools that use a "generic" signature (PipelineTool, SpaceToolWrapper, LangChainToolWrapper)
+        # ===== 第五阶段：验证 forward() 方法签名与 inputs 的一致性 =====
+        # 某些特殊工具（PipelineTool, SpaceToolWrapper, LangChainToolWrapper）使用通用签名 *args/**kwargs，
+        # 通过 skip_forward_signature_validation = True 跳过此检查
         if not (
             hasattr(self, "skip_forward_signature_validation")
             and getattr(self, "skip_forward_signature_validation") is True
         ):
+            # 检查 forward() 的参数名是否和 inputs 的 key 完全一致
+            # 例如 inputs={"query": ..., "top_k": ...} → forward(self, query, top_k)
             signature = inspect.signature(self.forward)
             actual_keys = set(key for key in signature.parameters.keys() if key != "self")
             expected_keys = set(self.inputs.keys())
@@ -292,13 +336,16 @@ class Tool(BaseTool):
                     f"It should take 'self' as its first argument, then its next arguments should match the keys of tool attribute 'inputs'."
                 )
 
+            # 从 forward() 的类型注解中提取 JSON Schema，用于交叉验证 nullable 属性
+            # 确保 inputs 中标记为 nullable 的参数，在 forward() 签名中也是 Optional 类型，反之亦然
             json_schema = _convert_type_hints_to_json_schema(self.forward, error_on_missing_type_hints=False)[
                 "properties"
-            ]  # This function will not raise an error on missing docstrings, contrary to get_json_schema
+            ]
             for key, value in self.inputs.items():
                 assert key in json_schema, (
                     f"Input '{key}' should be present in function signature, found only {json_schema.keys()}"
                 )
+                # 双向检查：inputs 说 nullable → 签名也必须是 Optional；签名是 Optional → inputs 也必须说 nullable
                 if "nullable" in value:
                     assert "nullable" in json_schema[key], (
                         f"Nullable argument '{key}' in inputs should have key 'nullable' set to True in function signature."
@@ -309,6 +356,20 @@ class Tool(BaseTool):
                     )
 
     def forward(self, *args, **kwargs):
+        """工具的核心逻辑方法，子类必须重写。
+
+        与 __call__ 的分工类似于 PyTorch 的 nn.Module：
+        - __call__() 处理框架层面的杂活（延迟初始化、参数兼容、类型转换）
+        - forward()  只负责工具的实际功能（搜索、计算、文件处理等）
+
+        子类实现时，参数名必须与 inputs 字典的 key 完全一致，例如：
+            inputs = {"query": {"type": "string", ...}, "top_k": {"type": "integer", ...}}
+            def forward(self, query: str, top_k: int):  # 参数名必须是 query 和 top_k
+                ...
+
+        不要直接调用 forward()，应该通过 tool(args) 即 __call__() 调用，
+        这样才能享受延迟初始化和类型转换等框架功能。
+        """
         raise NotImplementedError("Write this method in your subclass of `Tool`.")
 
     def __call__(self, *args, sanitize_inputs_outputs: bool = False, **kwargs):
