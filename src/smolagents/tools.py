@@ -524,7 +524,10 @@ class Tool(BaseTool):
             import re
 
             def add_self_argument(source_code: str) -> str:
-                """Add 'self' as first argument to a function definition if not present."""
+                """给函数签名加上 self 参数。
+                @tool 创建的原函数是普通函数（没有 self），但序列化后要变成类方法，
+                类方法必须有 self，所以用正则匹配 def forward(...) 并在参数列表开头插入 self。
+                """
                 pattern = r"def forward\(((?!self)[^)]*)\)"
 
                 def replacement(match):
@@ -556,11 +559,15 @@ class Tool(BaseTool):
                     "Cannot save objects created with from_space, from_langchain or from_gradio, as this would create errors."
                 )
 
+            # 验证类的合法性：类属性必须是简单字面量、__init__ 参数必须有默认值、
+            # 所有方法必须自包含（和路径一的 MethodChecker 检查类似，但更全面）
             validate_tool_attributes(self.__class__)
-            # 直接提取整个类的源码
+            # 直接提取整个类的源码（继承方式创建的工具本身就是完整的类，不需要拼）
             tool_code = "from typing import Any, Optional\n" + instance_to_source(self, base_cls=Tool)
 
-        # 从生成的代码中提取第三方依赖（排除标准库），smolagents 始终作为依赖
+        # 从生成的代码中提取 import 语句，过滤掉标准库模块（如 os、json），
+        # 只保留第三方依赖（如 requests、transformers），并强制加上 smolagents 自身。
+        # 这样别人拿到代码后，pip install 这些依赖就能跑。
         requirements = {el for el in get_imports(tool_code) if el not in sys.stdlib_module_names} | {"smolagents"}
 
         tool_dict = {"name": self.name, "code": tool_code, "requirements": sorted(requirements)}
@@ -777,11 +784,22 @@ class Tool(BaseTool):
 
     @classmethod
     def from_code(cls, tool_code: str, **kwargs):
+        """从源代码字符串动态创建 Tool 实例。
+
+        这是反序列化的核心方法，from_dict() 和 from_hub() 最终都调到这里。
+
+        流程：
+        1. 创建一个临时模块，用 exec() 执行代码字符串（相当于"运行"这段代码）
+        2. 在执行结果中找到 Tool 的子类（排除 Tool 本身）
+        3. 实例化并返回
+
+        注意：exec() 会执行任意代码，所以 from_hub() 有 trust_remote_code 安全检查。
+        """
         module = types.ModuleType("dynamic_tool")
 
         exec(tool_code, module.__dict__)
 
-        # Find the Tool subclass
+        # 在动态模块中找到 Tool 子类（可能叫 SimpleTool、WebSearchTool 等任何名字）
         tool_class = next(
             (
                 obj
@@ -794,10 +812,11 @@ class Tool(BaseTool):
         if tool_class is None:
             raise ValueError("No Tool subclass found in the code.")
 
+        # inputs 可能是字符串形式的 dict（从源码 exec 出来的），需要转成真正的 dict
         if not isinstance(tool_class.inputs, dict):
             tool_class.inputs = ast.literal_eval(tool_class.inputs)
 
-        # Handle output_schema if it exists and is a string representation
+        # output_schema 同理，可能是字符串形式，需要转成 dict
         if hasattr(tool_class, "output_schema") and isinstance(tool_class.output_schema, str):
             tool_class.output_schema = ast.literal_eval(tool_class.output_schema)
 
@@ -1100,14 +1119,14 @@ def add_description(description):
 
 
 class ToolCollection:
-    """
-    Tool collections enable loading a collection of tools in the agent's toolbox.
+    """工具集合：批量加载多个工具到 Agent 的工具箱中。
 
-    Collections can be loaded from a collection in the Hub or from an MCP server, see:
-    - [`ToolCollection.from_hub`]
-    - [`ToolCollection.from_mcp`]
+    两种加载方式：
+    - from_hub(): 从 HuggingFace Hub 的 Collection 批量加载（每个 Space 变成一个工具）
+    - from_mcp(): 从 MCP 服务器加载（服务器暴露的每个能力变成一个工具）
 
-    For example and usage, see: [`ToolCollection.from_hub`] and [`ToolCollection.from_mcp`]
+    使用方式：
+        agent = CodeAgent(tools=[*tool_collection.tools], ...)
     """
 
     def __init__(self, tools: list[Tool]):
@@ -1120,21 +1139,26 @@ class ToolCollection:
         token: str | None = None,
         trust_remote_code: bool = False,
     ) -> "ToolCollection":
-        """Loads a tool collection from the Hub.
+        """从 HuggingFace Hub 的 Collection 批量加载工具。
 
-        it adds a collection of tools from all Spaces in the collection to the agent's toolbox
+        Collection 是 Hub 上的一个"合集"页面，里面可以包含 Space、Model、Dataset 等。
+        这个方法只会加载其中的 Space（每个 Space 对应一个 Tool），忽略 Model 和 Dataset。
 
-        > [!NOTE]
-        > Only Spaces will be fetched, so you can feel free to add models and datasets to your collection if you'd
-        > like for this collection to showcase them.
+        流程：
+        1. 通过 collection_slug 获取 Collection 的元信息
+        2. 筛选出所有 Space 类型的项目
+        3. 逐个调用 Tool.from_hub() 加载每个 Space 为 Tool
 
         Args:
-            collection_slug (str): The collection slug referencing the collection.
-            token (str, *optional*): The authentication token if the collection is private.
-            trust_remote_code (bool, *optional*, defaults to False): Whether to trust the remote code.
+            collection_slug (str): Collection 的唯一标识（在 Hub 页面 URL 中可以找到），
+                例如 "huggingface-tools/diffusion-tools-6630bb19a942c2306a2cdb6f"
+            token (str, *optional*): HuggingFace 认证 token，访问私有 Collection 时需要
+            trust_remote_code (bool, *optional*, defaults to False):
+                是否信任远程代码。因为底层调 Tool.from_hub() 会 exec 执行代码，
+                必须设为 True 才能加载。
 
         Returns:
-            ToolCollection: A tool collection instance loaded with the tools.
+            ToolCollection: 包含所有加载好的工具的集合实例
 
         Example:
         ```py
@@ -1146,9 +1170,11 @@ class ToolCollection:
         >>> agent.run("Please draw me a picture of rivers and lakes.")
         ```
         """
+        # 从 Collection 中筛选出所有 Space 类型的项目（忽略 model 和 dataset）
         _collection = get_collection(collection_slug, token=token)
         _hub_repo_ids = {item.item_id for item in _collection.items if item.item_type == "space"}
 
+        # 逐个从 Hub 加载工具（每个 Space 对应一个 Tool）
         tools = [Tool.from_hub(repo_id, token, trust_remote_code) for repo_id in _hub_repo_ids]
 
         return cls(tools)
@@ -1161,39 +1187,37 @@ class ToolCollection:
         trust_remote_code: bool = False,
         structured_output: bool | None = None,
     ) -> "ToolCollection":
-        """Automatically load a tool collection from an MCP server.
+        """从 MCP 服务器自动加载工具集合。
 
-        This method supports Stdio, Streamable HTTP, and legacy HTTP+SSE MCP servers. Look at the `server_parameters`
-        argument for more details on how to connect to each MCP server.
+        MCP（Model Context Protocol）是一种让 Agent 连接外部工具服务器的协议。
+        服务器暴露的每个能力（如搜索、数据库查询等）会被自动转换成一个 smolagents Tool。
 
-        Note: a separate thread will be spawned to run an asyncio event loop handling
-        the MCP server.
+        支持三种连接方式：
+        - Stdio: 通过子进程的标准输入/输出通信（本地工具服务器）
+        - Streamable HTTP: 通过 HTTP 连接远程服务器（推荐）
+        - SSE: 旧版 HTTP+SSE 协议（已废弃）
+
+        注意：必须用 with 语句调用（context manager），因为需要管理连接的生命周期。
+        with 块结束时会自动断开连接、清理资源。
+        内部会启动一个独立线程运行 asyncio 事件循环来处理 MCP 通信。
 
         Args:
-            server_parameters (`mcp.StdioServerParameters` or `dict`):
-                Configuration parameters to connect to the MCP server. This can be:
-
-                - An instance of `mcp.StdioServerParameters` for connecting a Stdio MCP server via standard input/output using a subprocess.
-
-                - A `dict` with at least:
-                  - "url": URL of the server.
-                  - "transport": Transport protocol to use, one of:
-                    - "streamable-http": Streamable HTTP transport (default).
-                    - "sse": Legacy HTTP+SSE transport (deprecated).
+            server_parameters (`mcp.StdioServerParameters` 或 `dict`):
+                连接 MCP 服务器的配置参数：
+                - StdioServerParameters: 本地子进程方式，需指定 command（如 "uvx"）和 args
+                - dict: HTTP 方式，至少包含：
+                  - "url": 服务器地址（如 "http://127.0.0.1:8000/mcp"）
+                  - "transport": 传输协议，"streamable-http"（默认）或 "sse"（旧版）
             trust_remote_code (`bool`, *optional*, defaults to `False`):
-                Whether to trust the execution of code from tools defined on the MCP server.
-                This option should only be set to `True` if you trust the MCP server,
-                and undertand the risks associated with running remote code on your local machine.
-                If set to `False`, loading tools from MCP will fail.
+                是否信任 MCP 服务器的远程代码。MCP 工具会在本地执行，
+                必须设为 True 才能加载（和 from_hub 的安全检查一样）。
             structured_output (`bool`, *optional*, defaults to `False`):
-                Whether to enable structured output features for MCP tools. If True, enables:
-                - Support for outputSchema in MCP tools
-                - Structured content handling (structuredContent from MCP responses)
-                - JSON parsing fallback for structured data
-                If False, uses the original simple text-only behavior for backwards compatibility.
+                是否启用结构化输出。True 时支持 MCP 工具的 outputSchema 和
+                structuredContent 响应。False 时只返回纯文本（向后兼容）。
+                未来版本会默认改为 True。
 
         Returns:
-            ToolCollection: A tool collection instance.
+            ToolCollection: 包含从 MCP 服务器加载的所有工具的集合实例
 
         Example with a Stdio MCP server:
         ```py
@@ -1228,7 +1252,7 @@ class ToolCollection:
         >>>     agent.run("Please find a remedy for hangover.")
         ```
         """
-        # Handle future warning for structured_output default value change
+        # structured_output 参数未来版本会默认改为 True，这里做过渡期警告
         if structured_output is None:
             warnings.warn(
                 "Parameter 'structured_output' was not specified. "
@@ -1240,6 +1264,8 @@ class ToolCollection:
             )
             structured_output = False
 
+        # 导入 MCP 适配器：MCPAdapt 负责连接 MCP 服务器，
+        # SmolAgentsAdapter 负责把 MCP 工具转换成 smolagents 的 Tool 格式
         try:
             from mcpadapt.core import MCPAdapt
             from mcpadapt.smolagents_adapter import SmolAgentsAdapter
@@ -1247,6 +1273,8 @@ class ToolCollection:
             raise ImportError(
                 """Please install 'mcp' extra to use ToolCollection.from_mcp: `pip install 'smolagents[mcp]'`."""
             )
+        # 如果传的是 dict 格式（HTTP 连接），处理 transport 参数
+        # 默认使用 streamable-http，也支持旧版 sse
         if isinstance(server_parameters, dict):
             transport = server_parameters.get("transport")
             if transport is None:
@@ -1256,11 +1284,16 @@ class ToolCollection:
                 raise ValueError(
                     f"Unsupported transport: {transport}. Supported transports are 'streamable-http' and 'sse'."
                 )
+        # 安全检查：和 from_hub 一样，必须明确信任远程代码
         if not trust_remote_code:
             raise ValueError(
                 "Loading tools from MCP requires you to acknowledge you trust the MCP server, "
                 "as it will execute code on your local machine: pass `trust_remote_code=True`."
             )
+        # 核心：用 context manager 管理 MCP 连接的生命周期
+        # MCPAdapt 连接服务器，SmolAgentsAdapter 把 MCP 工具转成 smolagents Tool
+        # with 块结束时自动断开连接、清理资源
+        # yield 而不是 return，因为这是个 @contextmanager 生成器
         with MCPAdapt(server_parameters, SmolAgentsAdapter(structured_output=structured_output)) as tools:
             yield cls(tools)
 
@@ -1285,7 +1318,13 @@ def tool(tool_function: Callable) -> Tool:
             Should also have a docstring including the description of the function
             and an 'Args:' part where each argument is described.
     """
+    # ===== 第一步：从函数中提取 JSON Schema =====
+    # get_json_schema() 通过反射解析函数的类型注解和 docstring，自动生成：
+    #   name（函数名）、description（docstring 第一段）、
+    #   parameters（参数类型+描述）、return（返回值类型）
     tool_json_schema = get_json_schema(tool_function)["function"]
+    # 检查返回值类型：有参数的函数必须写 -> 类型注解（包括 -> None）
+    # 无参数无返回值的函数（如 ping()）自动补 null
     if "return" not in tool_json_schema:
         if len(tool_json_schema["parameters"]["properties"]) == 0:
             tool_json_schema["return"] = {"type": "null"}
@@ -1294,52 +1333,66 @@ def tool(tool_function: Callable) -> Tool:
                 "Tool return type not found: make sure your function has a return type hint!"
             )
 
+    # ===== 第二步：创建 SimpleTool 空壳类 =====
+    # 先建一个空壳，后面再往里填属性和方法
+    # is_initialized=True 表示不需要延迟初始化（普通函数没有重操作要加载）
     class SimpleTool(Tool):
         def __init__(self):
             self.is_initialized = True
 
-    # Set the class attributes
+    # 把从 JSON Schema 中提取的元信息设为类属性
+    # 等价于手写 Tool 子类时的 name = "xxx", description = "xxx" 等
     SimpleTool.name = tool_json_schema["name"]
     SimpleTool.description = tool_json_schema["description"]
     SimpleTool.inputs = tool_json_schema["parameters"]["properties"]
     SimpleTool.output_type = tool_json_schema["return"]["type"]
 
-    # Set output_schema if it exists in the JSON schema
+    # 处理结构化输出（如返回 TypedDict 时）
+    # output_schema 可能出现在两个不同位置，取决于 get_json_schema 的实现
     if "output_schema" in tool_json_schema:
         SimpleTool.output_schema = tool_json_schema["output_schema"]
     elif "return" in tool_json_schema and "schema" in tool_json_schema["return"]:
         SimpleTool.output_schema = tool_json_schema["return"]["schema"]
 
+    # ===== 第三步：绑定 forward 方法 =====
+    # 用 wraps 包一层原函数，保留原函数的 __name__、__doc__ 等元信息
+    # 包一层而不是直接赋值，是为了隔离——后面会修改 forward 的 __signature__ 和 __source__，
+    # 不包一层的话会污染用户的原函数
     @wraps(tool_function)
     def wrapped_function(*args, **kwargs):
         return tool_function(*args, **kwargs)
 
-    # Bind the copied function to the forward method
+    # 绑定为 staticmethod，因为原函数没有 self 参数
     SimpleTool.forward = staticmethod(wrapped_function)
 
-    # Get the signature parameters of the tool function
+    # 但 validate_arguments 期望 forward 签名有 self，所以手动给签名加上 self
+    # 注意：只是改了签名的"外观"，实际调用时 staticmethod 不会传 self
     sig = inspect.signature(tool_function)
-    # - Add "self" as first parameter to tool_function signature
     new_sig = sig.replace(
         parameters=[inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)] + list(sig.parameters.values())
     )
-    # - Set the signature of the forward method
     SimpleTool.forward.__signature__ = new_sig
 
-    # Create and attach the source code of the dynamically created tool class and forward method
-    # - Get the source code of tool_function
+    # ===== 第四步：保存源码（给序列化 to_dict/push_to_hub 用） =====
+    # 动态创建的类没有 .py 文件，inspect.getsource() 拿不到源码，
+    # 所以手动拼出完整的类源码，存到 __source__ 属性上。
+    # get_source() 会优先读 __source__，这就是为它准备的。
+
+    # 拿到原函数的源码
     tool_source = textwrap.dedent(inspect.getsource(tool_function))
-    # - Remove the tool decorator and function definition line
     lines = tool_source.splitlines()
     tree = ast.parse(tool_source)
-    #   - Find function definition
+
+    # 用 AST 找到函数定义节点
     func_node = next((node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)), None)
     if not func_node:
         raise ValueError(
             f"No function definition found in the provided source of {tool_function.__name__}. "
             "Ensure the input is a standard function."
         )
-    #   - Extract decorator lines
+    # 处理装饰器：提取 @tool 以外的其他装饰器（如 @cache 等）
+    # @tool 本身会被去掉（序列化后变成类方法，不需要装饰器了）
+    # 如果有其他装饰器，会警告可能影响序列化
     decorator_lines = ""
     if func_node.decorator_list:
         tool_decorators = [d for d in func_node.decorator_list if isinstance(d, ast.Name) and d.id == "tool"]
@@ -1355,13 +1408,15 @@ def tool(tool_function: Callable) -> Tool:
         decorator_start = tool_decorators[0].end_lineno if tool_decorators else 0
         decorator_end = func_node.decorator_list[-1].end_lineno
         decorator_lines = "\n".join(lines[decorator_start:decorator_end])
-    #   - Extract tool source body
-    body_start = func_node.body[0].lineno - 1  # AST lineno starts at 1
+    # 提取函数体（去掉 def 行和装饰器，只留函数内部的代码）
+    body_start = func_node.body[0].lineno - 1
     tool_source_body = "\n".join(lines[body_start:])
-    # - Create the forward method source, including def line and indentation
+
+    # 拼出 forward 方法的源码（用带 self 的新签名）
     forward_method_source = f"def forward{new_sig}:\n{tool_source_body}"
-    # - Create the class source
-    indent = " " * 4  # for class method
+
+    # 拼出完整的类源码，包含类定义 + 类属性 + __init__ + forward 方法
+    indent = " " * 4
     class_source = (
         textwrap.dedent(f"""
         class SimpleTool(Tool):
@@ -1377,10 +1432,11 @@ def tool(tool_function: Callable) -> Tool:
         + textwrap.indent(decorator_lines, indent)
         + textwrap.indent(forward_method_source, indent)
     )
-    # - Store the source code on both class and method for inspection
+    # 把源码存到类和方法上，供 get_source() 读取
     SimpleTool.__source__ = class_source
     SimpleTool.forward.__source__ = forward_method_source
 
+    # ===== 最后：实例化并返回 =====
     simple_tool = SimpleTool()
     return simple_tool
 
