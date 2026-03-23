@@ -298,67 +298,78 @@ def safer_func(
 
 
 class PrintContainer:
+    """print 输出的收集容器。
+
+    沙箱中的 print() 不会打印到终端，而是把内容追加到这个容器中。
+    执行结束后，容器中的内容作为 CodeOutput.logs 返回给 Agent。
+
+    使用方式（在 evaluate_python_code 中）：
+        state["_print_outputs"] = PrintContainer()
+        # LLM 代码中的 print("hello") 会触发：
+        #   state["_print_outputs"] += "hello"
+    """
+
     def __init__(self):
         self.value = ""
 
     def append(self, text):
+        """追加文本内容"""
         self.value += text
         return self
 
     def __iadd__(self, other):
-        """Implements the += operator"""
+        """实现 += 运算符，支持 state["_print_outputs"] += "text" """
         self.value += str(other)
         return self
 
     def __str__(self):
-        """String representation"""
+        """返回收集到的全部 print 输出"""
         return self.value
 
     def __repr__(self):
-        """Representation for debugging"""
         return f"PrintContainer({self.value})"
 
     def __len__(self):
-        """Implements len() function support"""
+        """支持 len()，用于检查输出是否为空"""
         return len(self.value)
 
 
 class BreakException(Exception):
+    """模拟 break 语句：在 evaluate_for / evaluate_while 中，
+    遇到 break 时抛出此异常，由外层循环的 except 捕获来跳出循环。"""
     pass
 
 
 class ContinueException(Exception):
+    """模拟 continue 语句：抛出后被循环体的 except 捕获，跳到下一次迭代。"""
     pass
 
 
 class ReturnException(Exception):
+    """模拟 return 语句：在 create_function 创建的函数体中，
+    遇到 return 时抛出此异常，携带返回值，由函数调用处捕获。"""
     def __init__(self, value):
         self.value = value
 
 
 class ExecutionTimeoutError(Exception):
-    """Exception raised when code execution exceeds the maximum allowed time."""
-
+    """代码执行超时异常。当执行时间超过 MAX_EXECUTION_TIME_SECONDS（默认30秒）时抛出。
+    由 timeout() 装饰器中的 ThreadPoolExecutor 触发。"""
     pass
 
 
 def timeout(timeout_seconds: int):
-    """
-    Decorator to limit the execution time of a function using threading.
+    """执行超时装饰器：限制函数的最大执行时间。
 
-    This implementation is cross-platform (works on Windows) and thread-safe (works when
-    called from any thread, not just the main thread), unlike signal-based approaches.
+    实现方式：用 ThreadPoolExecutor 在子线程中执行函数，主线程等待指定秒数。
+    - 跨平台：Windows 也能用（不依赖 signal）
+    - 线程安全：可以在非主线程中调用（signal 只能在主线程用）
+
+    注意：超时后子线程不会被强制杀死（Python 无法安全杀线程），
+    它会继续在后台运行直到完成，但调用方已经收到 TimeoutError 继续往下走了。
 
     Args:
-        timeout_seconds (`int`): Maximum time in seconds allowed for function execution.
-
-    Raises:
-        ExecutionTimeoutError: If the function execution exceeds the timeout period.
-
-    Note:
-        If a timeout occurs, the thread running the function cannot be forcefully killed
-        in Python, so it will continue running in the background until completion. However,
-        the caller will receive a TimeoutError and can continue execution.
+        timeout_seconds: 最大允许执行时间（秒）
     """
 
     def decorator(func):
@@ -1656,28 +1667,32 @@ def evaluate_python_code(
     max_print_outputs_length: int = DEFAULT_MAX_LEN_OUTPUT,
     timeout_seconds: int | None = MAX_EXECUTION_TIME_SECONDS,
 ):
-    """
-    Evaluate a python expression using the content of the variables stored in a state and only evaluating a given set
-    of functions.
+    """沙箱执行 Python 代码的核心函数。
 
-    This function will recurse through the nodes of the tree provided.
+    整体流程：
+        1. ast.parse(code) 将代码字符串解析为 AST 语法树
+        2. 初始化 state（变量存储）、print 容器、操作计数器
+        3. 包装 final_answer 为异常触发版本
+        4. 遍历 AST 顶层节点，逐个调用 evaluate_ast() 模拟执行
+        5. 返回 (最终结果, 是否为 final_answer)
 
     Args:
-        code (`str`):
-            The code to evaluate.
-        static_tools (`Dict[str, Callable]`):
-            The functions that may be called during the evaluation. These can also be agents in a multiagent setting.
-            These tools cannot be overwritten in the code: any assignment to their name will raise an error.
-        custom_tools (`Dict[str, Callable]`):
-            The functions that may be called during the evaluation.
-            These tools can be overwritten in the code: any assignment to their name will overwrite them.
-        state (`Dict[str, Any]`):
-            A dictionary mapping variable names to values. The `state` should contain the initial inputs but will be
-            updated by this function to contain all variables as they are evaluated.
-            The print outputs will be stored in the state under the key "_print_outputs".
-        timeout_seconds (`int`, *optional*, defaults to `MAX_EXECUTION_TIME_SECONDS`):
-            Maximum time in seconds allowed for code execution. Set to `None` to disable timeout.
+        code: LLM 生成的 Python 代码字符串
+        static_tools: 不可被代码覆盖的工具函数（Agent 的工具 + 内置函数）
+            赋值给同名变量会报错，保证工具不被篡改
+        custom_tools: 可被代码覆盖的工具函数
+            赋值给同名变量会替换掉原来的工具
+        state: 变量存储字典，跨步骤持久化（上一步定义的变量下一步还能用）
+        authorized_imports: 允许导入的模块白名单
+        max_print_outputs_length: print 输出的最大字符数，超出则截断
+        timeout_seconds: 最大执行时间（秒），None 表示不限时
+
+    Returns:
+        tuple: (result, is_final_answer)
+            - result: 代码最后一个表达式的值，或 final_answer() 的参数
+            - is_final_answer: 是否调用了 final_answer()
     """
+    # ===== 第1步：解析代码为 AST =====
     try:
         expression = ast.parse(code)
     except SyntaxError as e:
@@ -1687,41 +1702,48 @@ def evaluate_python_code(
             f"{' ' * (e.offset or 0)}^"
         )
 
+    # ===== 第2步：初始化执行环境 =====
     if state is None:
         state = {}
-    static_tools = static_tools.copy() if static_tools is not None else {}
+    static_tools = static_tools.copy() if static_tools is not None else {}  # 复制一份，避免修改原始字典
     custom_tools = custom_tools if custom_tools is not None else {}
-    state["_print_outputs"] = PrintContainer()
-    state["_operations_count"] = {"counter": 0}
+    state["_print_outputs"] = PrintContainer()  # 每次执行重置 print 容器
+    state["_operations_count"] = {"counter": 0}  # 操作计数器（用 dict 包装以便在嵌套函数中修改）
 
+    # ===== 第3步：包装 final_answer =====
     # 将 final_answer 工具包装为异常触发版本：
     # 当 LLM 代码调用 final_answer(result) 时，先执行原始工具，再抛出异常终止执行
     if "final_answer" in static_tools:
         previous_final_answer = static_tools["final_answer"]
 
-        def final_answer(*args, **kwargs):  # Allow arbitrary arguments to be passed
+        def final_answer(*args, **kwargs):
+            # 先调用原始 final_answer 工具（可能做格式化等处理），再抛异常
             raise FinalAnswerException(previous_final_answer(*args, **kwargs))
 
         static_tools["final_answer"] = final_answer
 
-    # Define the actual execution logic
+    # ===== 第4步：定义实际执行逻辑 =====
     def _execute_code():
         result = None
         try:
+            # 遍历 AST 顶层节点，逐个执行（赋值、函数定义、表达式等）
             for node in expression.body:
                 result = evaluate_ast(node, state, static_tools, custom_tools, authorized_imports)
+            # 正常执行完毕：截断过长的 print 输出
             state["_print_outputs"].value = truncate_content(
                 str(state["_print_outputs"]), max_length=max_print_outputs_length
             )
             is_final_answer = False
             return result, is_final_answer
         except FinalAnswerException as e:
+            # 捕获 final_answer() 触发的异常 → 标记为最终答案
             state["_print_outputs"].value = truncate_content(
                 str(state["_print_outputs"]), max_length=max_print_outputs_length
             )
             is_final_answer = True
             return e.value, is_final_answer
         except Exception as e:
+            # 其他异常 → 包装为 InterpreterError，附带出错行的源码
             state["_print_outputs"].value = truncate_content(
                 str(state["_print_outputs"]), max_length=max_print_outputs_length
             )
@@ -1729,7 +1751,7 @@ def evaluate_python_code(
                 f"Code execution failed at line '{ast.get_source_segment(code, node)}' due to: {type(e).__name__}: {e}"
             )
 
-    # Apply timeout if specified
+    # ===== 第5步：应用超时装饰器并执行 =====
     if timeout_seconds is not None:
         _execute_code = timeout(timeout_seconds)(_execute_code)
 
@@ -1765,23 +1787,26 @@ class PythonExecutor(ABC):
 
 
 class LocalPythonExecutor(PythonExecutor):
-    """
-    Executor of Python code in a local environment.
+    """本地 Python 沙箱执行器 —— CodeAgent 的默认执行器。
 
-    This executor evaluates Python code with restricted access to imports and built-in functions,
-    making it suitable for running untrusted code. It maintains state between executions,
-    allows for custom tools and functions to be made available to the code, and captures
-    print outputs separately from return values.
+    在当前进程内通过 AST 解释器执行 LLM 生成的代码，不启动子进程。
+    每次 Agent 的一个 step 调用 __call__() 执行一段代码。
+
+    关键特性：
+        - state 跨步骤持久化：step1 定义的变量 step2 还能用
+        - static_tools 不可覆盖：LLM 代码不能给工具名赋值（防止篡改）
+        - print 输出收集：不打印到终端，收集到 logs 中返回
+        - 导入白名单：只允许安全模块
+
+    与远程执行器的区别：
+        - LocalPythonExecutor：快，无网络开销，但安全性依赖 AST 解释器
+        - 远程执行器（E2B/Docker/Modal 等）：慢，有网络开销，但物理隔离更安全
 
     Args:
-        additional_authorized_imports (`list[str]`):
-            Additional authorized imports for the executor.
-        max_print_outputs_length (`int`, defaults to `DEFAULT_MAX_LEN_OUTPUT=50_000`):
-            Maximum length of the print outputs.
-        additional_functions (`dict[str, Callable]`, *optional*):
-            Additional Python functions to be added to the executor.
-        timeout_seconds (`int`, *optional*, defaults to `MAX_EXECUTION_TIME_SECONDS`):
-            Maximum time in seconds allowed for code execution. Set to `None` to disable timeout.
+        additional_authorized_imports: 额外允许导入的模块列表
+        max_print_outputs_length: print 输出最大字符数
+        additional_functions: 额外注入的 Python 函数（会合并到 static_tools）
+        timeout_seconds: 单次执行最大时间（秒）
     """
 
     def __init__(
@@ -1792,25 +1817,22 @@ class LocalPythonExecutor(PythonExecutor):
         timeout_seconds: int | None = MAX_EXECUTION_TIME_SECONDS,
     ):
         self.custom_tools = {}
-        self.state = {"__name__": "__main__"}
+        self.state = {"__name__": "__main__"}  # 变量存储，跨步骤持久化
         self.max_print_outputs_length = max_print_outputs_length
         if max_print_outputs_length is None:
             self.max_print_outputs_length = DEFAULT_MAX_LEN_OUTPUT
+        # 合并默认白名单 + 用户额外白名单，去重
         self.additional_authorized_imports = additional_authorized_imports
         self.authorized_imports = list(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self._check_authorized_imports_are_installed()
-        self.static_tools = None
+        self.static_tools = None  # 在 send_tools() 中初始化
         self.additional_functions = additional_functions or {}
         self.timeout_seconds = timeout_seconds
 
     def _check_authorized_imports_are_installed(self):
-        """
-        Check that all authorized imports are installed on the system.
-
-        Handles wildcard imports ("*") and partial star-pattern imports (e.g., "os.*").
-
-        Raises:
-            InterpreterError: If any of the authorized modules are not installed.
+        """检查白名单中的模块是否已安装。
+        在初始化时就检查，避免运行时才发现模块缺失。
+        跳过通配符 "*"，只检查顶层模块名（如 "numpy.linalg" 只检查 "numpy"）。
         """
         missing_modules = [
             base_module
@@ -1824,23 +1846,31 @@ class LocalPythonExecutor(PythonExecutor):
             )
 
     def __call__(self, code_action: str) -> CodeOutput:
+        """执行一段 LLM 生成的代码（Agent 每个 step 调用一次）。
+
+        调用 evaluate_python_code() 执行代码，然后把结果包装成 CodeOutput 返回。
+        注意 self.state 是持久化的，所以上一步的变量这一步还能用。
+        """
         output, is_final_answer = evaluate_python_code(
-            code_action,
-            static_tools=self.static_tools,
-            custom_tools=self.custom_tools,
-            state=self.state,
-            authorized_imports=self.authorized_imports,
-            max_print_outputs_length=self.max_print_outputs_length,
-            timeout_seconds=self.timeout_seconds,
+            code_action,                                        # code: LLM 生成的代码字符串
+            static_tools=self.static_tools,                     # 不可覆盖的工具（Agent工具 + 内置函数）
+            custom_tools=self.custom_tools,                     # 可覆盖的工具
+            state=self.state,                                   # 跨步骤持久化的变量存储
+            authorized_imports=self.authorized_imports,          # 导入白名单
+            max_print_outputs_length=self.max_print_outputs_length,  # print 输出最大长度
+            timeout_seconds=self.timeout_seconds,               # 执行超时秒数
         )
         logs = str(self.state["_print_outputs"])
         return CodeOutput(output=output, logs=logs, is_final_answer=is_final_answer)
 
     def send_variables(self, variables: dict[str, Any]):
+        """注入变量到 state 中（Agent 的 additional_args 通过这个方法传入）。"""
         self.state.update(variables)
 
     def send_tools(self, tools: dict[str, Tool]):
-        # Combine agent tools, base Python tools, and additional Python functions
+        """初始化 static_tools：合并 Agent 工具 + 内置安全函数 + 额外函数。
+        这些工具在沙箱中不可被 LLM 代码覆盖。
+        """
         self.static_tools = {**tools, **BASE_PYTHON_TOOLS.copy(), **self.additional_functions}
 
 
