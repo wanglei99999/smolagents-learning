@@ -1707,8 +1707,8 @@ def evaluate_python_code(
         state = {}
     static_tools = static_tools.copy() if static_tools is not None else {}  # 复制一份，避免修改原始字典
     custom_tools = custom_tools if custom_tools is not None else {}
-    state["_print_outputs"] = PrintContainer()  # 每次执行重置 print 容器
-    state["_operations_count"] = {"counter": 0}  # 操作计数器（用 dict 包装以便在嵌套函数中修改）
+    state["_print_outputs"] = PrintContainer()  # 每次执行重置 print 容器，收集print输出，沙箱控制输出
+    state["_operations_count"] = {"counter": 0}  # 操作计数器（用 dict 包装以便在嵌套函数中修改），闭包中修改外层函数的变量时，整数是不可修改变量，要用可修改的引用类型
 
     # ===== 第3步：包装 final_answer =====
     # 将 final_answer 工具包装为异常触发版本：
