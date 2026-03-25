@@ -537,59 +537,78 @@ def create_function(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Callable:
-    source_code = ast.unparse(func_def)
+    """在沙箱中创建函数 —— 返回一个闭包，调用时用 AST 解释器执行函数体。
+
+    不使用 exec/compile，而是把函数体的 AST 节点保存在闭包中，
+    每次调用时创建局部作用域（func_state），然后逐语句 evaluate_ast 执行。
+
+    return 语句通过 ReturnException 异常实现：
+        evaluate_ast 遇到 ast.Return → raise ReturnException(value)
+        → 这里的 except ReturnException 捕获 → 拿到返回值
+    """
+    source_code = ast.unparse(func_def)  # 保存源码（用于调试和 __source__ 属性）
 
     def new_func(*args: Any, **kwargs: Any) -> Any:
+        # ===== 创建函数的局部作用域 =====
+        # 浅拷贝外层 state，函数内部能看到外层变量，但赋值不会影响外层
         func_state = state.copy()
-        arg_names = [arg.arg for arg in func_def.args.args]
+
+        # ===== 参数绑定 =====
+        arg_names = [arg.arg for arg in func_def.args.args]  # 形参名列表，如 ["data", "count"]
+
+        # 计算默认值（def func(x, y=10) 中的 10）
         default_values = [
             evaluate_ast(d, state, static_tools, custom_tools, authorized_imports) for d in func_def.args.defaults
         ]
 
-        # Apply default values
+        # 默认值从右往左对齐：def func(a, b, c=1, d=2) → defaults = {"c": 1, "d": 2}
         defaults = dict(zip(arg_names[-len(default_values) :], default_values))
 
-        # Set positional arguments
+        # 绑定位置参数：func("hello", 5) → func_state["data"] = "hello", func_state["count"] = 5
         for name, value in zip(arg_names, args):
             func_state[name] = value
 
-        # Set keyword arguments
+        # 绑定关键字参数：func(count=5) → func_state["count"] = 5
         for name, value in kwargs.items():
             func_state[name] = value
 
-        # Handle variable arguments
+        # 处理 *args 可变参数
         if func_def.args.vararg:
             vararg_name = func_def.args.vararg.arg
             func_state[vararg_name] = args
 
+        # 处理 **kwargs 可变关键字参数
         if func_def.args.kwarg:
             kwarg_name = func_def.args.kwarg.arg
             func_state[kwarg_name] = kwargs
 
-        # Set default values for arguments that were not provided
+        # 未传入的参数使用默认值
         for name, value in defaults.items():
             if name not in func_state:
                 func_state[name] = value
 
-        # Update function state with self and __class__
+        # 如果是方法调用（第一个参数是 self），设置 self 和 __class__
         if func_def.args.args and func_def.args.args[0].arg == "self":
             if args:
                 func_state["self"] = args[0]
                 func_state["__class__"] = args[0].__class__
 
+        # ===== 执行函数体 =====
         result = None
         try:
             for stmt in func_def.body:
                 result = evaluate_ast(stmt, func_state, static_tools, custom_tools, authorized_imports)
         except ReturnException as e:
+            # return 语句触发的异常 → 拿到返回值
             result = e.value
 
+        # __init__ 按 Python 规范必须返回 None
         if func_def.name == "__init__":
             return None
 
         return result
 
-    # Store original AST, source code, and name
+    # 保存元信息（用于调试、序列化等）
     new_func.__ast__ = func_def
     new_func.__source__ = source_code
     new_func.__name__ = func_def.name
@@ -604,6 +623,12 @@ def evaluate_function_def(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Callable:
+    """处理 def 语句：创建函数对象并存入 custom_tools。
+
+    存入 custom_tools（而非 state）意味着：
+        - 后续代码可以通过 evaluate_call 的查找链找到它
+        - 可以被重新 def 覆盖（custom_tools 可覆盖，static_tools 不可）
+    """
     custom_tools[func_def.name] = create_function(func_def, state, static_tools, custom_tools, authorized_imports)
     return custom_tools[func_def.name]
 
@@ -713,7 +738,13 @@ def evaluate_augassign(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
+    """处理增量赋值：x += 1, count -= 1, data *= 2 等。
+
+    流程：读取当前值 → 计算右边的值 → 根据运算符计算新值 → 写回。
+    支持所有 Python 增量运算符：+=, -=, *=, /=, %=, **=, //=, &=, |=, ^=, <<=, >>=
+    """
     def get_current_value(target: ast.AST) -> Any:
+        """读取赋值目标的当前值（支持变量、索引、属性等）"""
         if isinstance(target, ast.Name):
             return state.get(target.id, 0)
         elif isinstance(target, ast.Subscript):
@@ -730,42 +761,45 @@ def evaluate_augassign(
         else:
             raise InterpreterError("AugAssign not supported for {type(target)} targets.")
 
+    # 第1步：读取当前值
     current_value = get_current_value(expression.target)
+    # 第2步：计算右边的值
     value_to_add = evaluate_ast(expression.value, state, static_tools, custom_tools, authorized_imports)
 
-    if isinstance(expression.op, ast.Add):
+    # 第3步：根据运算符计算新值
+    if isinstance(expression.op, ast.Add):          # +=
         if isinstance(current_value, list):
             if not isinstance(value_to_add, list):
                 raise InterpreterError(f"Cannot add non-list value {value_to_add} to a list.")
             current_value += value_to_add
         else:
             current_value += value_to_add
-    elif isinstance(expression.op, ast.Sub):
+    elif isinstance(expression.op, ast.Sub):        # -=
         current_value -= value_to_add
-    elif isinstance(expression.op, ast.Mult):
+    elif isinstance(expression.op, ast.Mult):       # *=
         current_value *= value_to_add
-    elif isinstance(expression.op, ast.Div):
+    elif isinstance(expression.op, ast.Div):        # /=
         current_value /= value_to_add
-    elif isinstance(expression.op, ast.Mod):
+    elif isinstance(expression.op, ast.Mod):        # %=
         current_value %= value_to_add
-    elif isinstance(expression.op, ast.Pow):
+    elif isinstance(expression.op, ast.Pow):        # **=
         current_value **= value_to_add
-    elif isinstance(expression.op, ast.FloorDiv):
+    elif isinstance(expression.op, ast.FloorDiv):   # //=
         current_value //= value_to_add
-    elif isinstance(expression.op, ast.BitAnd):
+    elif isinstance(expression.op, ast.BitAnd):     # &=
         current_value &= value_to_add
-    elif isinstance(expression.op, ast.BitOr):
+    elif isinstance(expression.op, ast.BitOr):      # |=
         current_value |= value_to_add
-    elif isinstance(expression.op, ast.BitXor):
+    elif isinstance(expression.op, ast.BitXor):     # ^=
         current_value ^= value_to_add
-    elif isinstance(expression.op, ast.LShift):
+    elif isinstance(expression.op, ast.LShift):     # <<=
         current_value <<= value_to_add
-    elif isinstance(expression.op, ast.RShift):
+    elif isinstance(expression.op, ast.RShift):     # >>=
         current_value >>= value_to_add
     else:
         raise InterpreterError(f"Operation {type(expression.op).__name__} is not supported.")
 
-    # Update the state: current_value has been updated in-place
+    # 第4步：把计算后的新值写回目标
     set_value(
         expression.target,
         current_value,
@@ -776,6 +810,7 @@ def evaluate_augassign(
     )
 
     return current_value
+
 
 
 def evaluate_boolop(
@@ -845,11 +880,18 @@ def evaluate_assign(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
+    """处理赋值语句：x = 10, a, b = func(), x = y = value
+
+    流程：先计算右边的值（递归 evaluate_ast），再通过 set_value 存入 state。
+    """
+    # 第1步：计算等号右边的值
     result = evaluate_ast(assign.value, state, static_tools, custom_tools, authorized_imports)
     if len(assign.targets) == 1:
+        # 常见情况：x = 10 或 a, b = 1, 2（单目标，可能是元组解包）
         target = assign.targets[0]
         set_value(target, result, state, static_tools, custom_tools, authorized_imports)
     else:
+        # 多目标赋值：x = y = 10（同一个值赋给多个变量）
         expanded_values = []
         for tgt in assign.targets:
             if isinstance(tgt, ast.Starred):
@@ -859,6 +901,7 @@ def evaluate_assign(
 
         for tgt, val in zip(assign.targets, expanded_values):
             set_value(tgt, val, state, static_tools, custom_tools, authorized_imports)
+    # 返回赋值的值（用于 evaluate_python_code 中记录最后一个表达式的结果）
     return result
 
 
@@ -870,14 +913,27 @@ def set_value(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> None:
+    """把值存入正确的位置 —— 赋值语句的核心写入逻辑。
+
+    根据赋值目标的类型分发：
+        x = 10          → ast.Name → state["x"] = 10
+        a, b = 1, 2     → ast.Tuple → 解包后递归 set_value
+        data[0] = "hi"  → ast.Subscript → 修改容器元素
+        obj.name = "x"  → ast.Attribute → 修改对象属性
+
+    安全机制：如果赋值目标是 static_tools 中的工具名，拒绝赋值（防止 LLM 覆盖工具）。
+    """
     if isinstance(target, ast.Name):
+        # 变量赋值：x = 10
+        # 安全检查：禁止覆盖 static_tools 中的工具（如 web_search, print, len 等）
         if target.id in static_tools:
             raise InterpreterError(f"Cannot assign to name '{target.id}': doing this would erase the existing tool!")
         state[target.id] = value
     elif isinstance(target, ast.Tuple):
+        # 元组解包：a, b = 1, 2 → 递归处理每个元素
         if not isinstance(value, tuple):
             if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
-                value = tuple(value)
+                value = tuple(value)  # 列表等可迭代对象转为元组
             else:
                 raise InterpreterError("Cannot unpack non-tuple value")
         if len(target.elts) != len(value):
@@ -885,10 +941,12 @@ def set_value(
         for i, elem in enumerate(target.elts):
             set_value(elem, value[i], state, static_tools, custom_tools, authorized_imports)
     elif isinstance(target, ast.Subscript):
+        # 索引赋值：data[0] = "hello", dict["key"] = value
         obj = evaluate_ast(target.value, state, static_tools, custom_tools, authorized_imports)
         key = evaluate_ast(target.slice, state, static_tools, custom_tools, authorized_imports)
         obj[key] = value
     elif isinstance(target, ast.Attribute):
+        # 属性赋值：obj.name = "test"
         obj = evaluate_ast(target.value, state, static_tools, custom_tools, authorized_imports)
         setattr(obj, target.attr, value)
 
@@ -900,61 +958,95 @@ def evaluate_call(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
+    """执行函数调用 —— 沙箱中最复杂的操作。
+
+    处理所有形式的函数调用：
+        web_search("hello")       → ast.Name 直接调用
+        obj.method(x)             → ast.Attribute 方法调用
+        get_func()("hello")      → ast.Call 链式调用
+        (lambda x: x+1)(5)       → ast.Lambda 调用
+        funcs[0]("hello")        → ast.Subscript 索引调用
+
+    执行流程：1.找到函数 → 2.计算参数 → 3.安全检查 → 4.调用
+    """
+
+    # ===== 前置检查：call.func 必须是合法的可调用形式 =====
     if not isinstance(call.func, (ast.Call, ast.Lambda, ast.Attribute, ast.Name, ast.Subscript)):
         raise InterpreterError(f"This is not a correct function: {call.func}).")
 
     func, func_name = None, None
 
+    # ===== 第1步：根据调用形式找到函数对象（func） =====
+
     if isinstance(call.func, ast.Call):
+        # 链式调用：get_func()("hello") → 先递归执行 get_func() 拿到返回的函数
         func = evaluate_ast(call.func, state, static_tools, custom_tools, authorized_imports)
     elif isinstance(call.func, ast.Lambda):
+        # lambda 调用：(lambda x: x+1)(5) → 先构造 lambda 函数对象
         func = evaluate_ast(call.func, state, static_tools, custom_tools, authorized_imports)
     elif isinstance(call.func, ast.Attribute):
+        # 方法调用：obj.method(x) → 先算出 obj，再从 obj 上取 method
         obj = evaluate_ast(call.func.value, state, static_tools, custom_tools, authorized_imports)
         func_name = call.func.attr
         if not hasattr(obj, func_name):
             raise InterpreterError(f"Object {obj} has no attribute {func_name}")
         func = getattr(obj, func_name)
     elif isinstance(call.func, ast.Name):
+        # 直接调用：web_search("hello"), len(data) → 按优先级查找函数
         func_name = call.func.id
         if func_name in state:
+            # 优先级1：state 中的变量（用户在代码中 def 的函数、import 的模块等）
             func = state[func_name]
         elif func_name in static_tools:
+            # 优先级2：static_tools（Agent 工具 + BASE_PYTHON_TOOLS 内置安全函数）
             func = static_tools[func_name]
         elif func_name in custom_tools:
+            # 优先级3：custom_tools（可被覆盖的工具）
             func = custom_tools[func_name]
         elif func_name in ERRORS:
+            # 优先级4：Python 内置异常类（ValueError, TypeError 等，用于 raise）
             func = ERRORS[func_name]
         else:
+            # 都找不到 → 报错：函数未授权
             raise InterpreterError(
                 f"Forbidden function evaluation: '{call.func.id}' is not among the explicitly allowed tools or defined/imported in the preceding code"
             )
     elif isinstance(call.func, ast.Subscript):
+        # 索引调用：funcs[0]("hello") → 先算出 funcs[0]，检查是否可调用
         func = evaluate_ast(call.func, state, static_tools, custom_tools, authorized_imports)
         if not callable(func):
             raise InterpreterError(f"This is not a correct function: {call.func}).")
         func_name = None
 
+    # ===== 第2步：计算所有参数 =====
+
+    # 位置参数
     args = []
     for arg in call.args:
         if isinstance(arg, ast.Starred):
+            # *args 解包：func(*my_list) → 展开 my_list 的每个元素
             args.extend(evaluate_ast(arg.value, state, static_tools, custom_tools, authorized_imports))
         else:
+            # 普通参数：递归计算值
             args.append(evaluate_ast(arg, state, static_tools, custom_tools, authorized_imports))
 
+    # 关键字参数
     kwargs = {}
     for keyword in call.keywords:
         if keyword.arg is None:
-            # **kwargs unpacking
+            # **kwargs 解包：func(**my_dict) → 展开字典
             starred_dict = evaluate_ast(keyword.value, state, static_tools, custom_tools, authorized_imports)
             if not isinstance(starred_dict, dict):
                 raise InterpreterError(f"Cannot unpack non-dict value in **kwargs: {type(starred_dict).__name__}")
             kwargs.update(starred_dict)
         else:
-            # Normal keyword argument
+            # 普通关键字参数：func(name="hello")
             kwargs[keyword.arg] = evaluate_ast(keyword.value, state, static_tools, custom_tools, authorized_imports)
 
+    # ===== 第3步：调用函数（含特殊处理和安全检查） =====
+
     if func_name == "super":
+        # 特殊处理 super()：需要从 state 中获取当前类和实例
         if not args:
             if "__class__" in state and "self" in state:
                 return super(state["__class__"], state["self"])
@@ -971,13 +1063,21 @@ def evaluate_call(
         else:
             raise InterpreterError("super() takes at most 2 arguments")
     elif func_name == "print":
+        # 特殊处理 print()：不打印到终端，把内容写入 _print_outputs 收集器
+        # 这就是 print 重定向的真正实现（custom_print 只是占位符）
         state["_print_outputs"] += " ".join(map(str, args)) + "\n"
         return None
-    else:  # Assume it's a callable object
+    else:
+        # ===== 通用路径：安全检查后调用 =====
+
+        # 安全检查1：禁止调用未授权的内置函数
+        # 比如 compile(), exec() 等危险函数，即使通过某种方式拿到了引用也不能调用
         if (inspect.getmodule(func) == builtins) and inspect.isbuiltin(func) and (func not in static_tools.values()):
             raise InterpreterError(
                 f"Invoking a builtin function that has not been explicitly added as a tool is not allowed ({func_name})."
             )
+        # 安全检查2：禁止调用 dunder 方法（__init__, __str__, __repr__ 除外）
+        # 防止通过 obj.__class__.__bases__ 等方式逃逸沙箱
         if (
             hasattr(func, "__name__")
             and func.__name__.startswith("__")
@@ -986,6 +1086,8 @@ def evaluate_call(
             and (func.__name__ not in ALLOWED_DUNDER_METHODS)
         ):
             raise InterpreterError(f"Forbidden call to dunder function: {func.__name__}")
+
+        # 通过所有安全检查 → 真正调用函数并返回结果
         return func(*args, **kwargs)
 
 
@@ -1340,35 +1442,45 @@ def evaluate_with(
 
 
 def get_safe_module(raw_module, authorized_imports, visited=None):
-    """Creates a safe copy of a module or returns the original if it's a function"""
-    # If it's a function or non-module object, return it directly
+    """创建模块的安全副本，递归处理嵌套的子模块。
+
+    为什么需要这个？因为模块内部可能嵌套其他模块的引用。
+    比如导入 numpy 后，numpy.os 可能指向 os 模块。
+    这个函数递归遍历模块的所有属性，对子模块也做同样的处理。
+
+    Args:
+        raw_module: 原始导入的模块对象
+        authorized_imports: 导入白名单
+        visited: 已访问模块的 id 集合（防止循环引用导致无限递归）
+    """
+    # 不是模块对象（是函数、类等）→ 直接返回，无需处理
     if not isinstance(raw_module, ModuleType):
         return raw_module
 
-    # Handle circular references: Initialize visited set for the first call
+    # 防止循环引用：A 模块引用 B，B 又引用 A → 用 visited 集合记录已处理的模块
     if visited is None:
         visited = set()
 
     module_id = id(raw_module)
     if module_id in visited:
-        return raw_module  # Return original for circular refs
+        return raw_module  # 已经处理过，直接返回原始模块避免无限递归
 
     visited.add(module_id)
 
-    # Create new module for actual modules
+    # 创建一个新的空模块壳（同名但属性为空）
     safe_module = ModuleType(raw_module.__name__)
 
-    # Copy all attributes by reference, recursively checking modules
+    # 逐个复制属性到安全副本，遇到子模块就递归处理
     for attr_name in dir(raw_module):
         try:
             attr_value = getattr(raw_module, attr_name)
         except (ImportError, AttributeError) as e:
-            # lazy / dynamic loading module -> INFO log and skip
+            # 某些模块有懒加载属性，访问时可能报错 → 跳过
             logger.info(
                 f"Skipping import error while copying {raw_module.__name__}.{attr_name}: {type(e).__name__} - {e}"
             )
             continue
-        # Recursively process nested modules, passing visited set
+        # 如果属性是子模块，递归创建安全副本
         if isinstance(attr_value, ModuleType):
             attr_value = get_safe_module(attr_value, authorized_imports, visited=visited)
 
@@ -1378,10 +1490,25 @@ def get_safe_module(raw_module, authorized_imports, visited=None):
 
 
 def evaluate_import(expression, state, authorized_imports):
+    """处理 import 语句 —— 沙箱安全的关键入口。
+
+    两种形式：
+        import json              → ast.Import，整个模块存入 state
+        from math import sqrt    → ast.ImportFrom，只取模块中的指定名字
+
+    安全流程：
+        1. check_import_authorized() 检查模块是否在白名单中
+        2. 真正导入模块
+        3. get_safe_module() 创建安全副本
+        4. 存入 state（后续代码通过 state 访问模块）
+    """
     if isinstance(expression, ast.Import):
+        # ===== import json / import json as j =====
         for alias in expression.names:
+            # alias.name = "json", alias.asname = "j"（如果有 as）
             if check_import_authorized(alias.name, authorized_imports):
-                raw_module = import_module(alias.name)
+                raw_module = import_module(alias.name)  # 真正导入
+                # 存入 state，key 是别名（有 as 用别名，没有用原名）
                 state[alias.asname or alias.name] = get_safe_module(raw_module, authorized_imports)
             else:
                 raise InterpreterError(
@@ -1389,18 +1516,24 @@ def evaluate_import(expression, state, authorized_imports):
                 )
         return None
     elif isinstance(expression, ast.ImportFrom):
+        # ===== from math import sqrt / from json import * =====
+        # expression.module = "math", expression.names = [alias(name="sqrt")]
         if check_import_authorized(expression.module, authorized_imports):
             raw_module = __import__(expression.module, fromlist=[alias.name for alias in expression.names])
             module = get_safe_module(raw_module, authorized_imports)
-            if expression.names[0].name == "*":  # Handle "from module import *"
-                if hasattr(module, "__all__"):  # If module has __all__, import only those names
+            if expression.names[0].name == "*":
+                # from module import * → 导入所有公开名字
+                if hasattr(module, "__all__"):
+                    # 模块定义了 __all__ → 只导入 __all__ 中列出的名字
                     for name in module.__all__:
                         state[name] = getattr(module, name)
-                else:  # If no __all__, import all public names (those not starting with '_')
+                else:
+                    # 没有 __all__ → 导入所有不以 _ 开头的名字
                     for name in dir(module):
                         if not name.startswith("_"):
                             state[name] = getattr(module, name)
-            else:  # regular from imports
+            else:
+                # from math import sqrt, ceil → 逐个取出指定的名字
                 for alias in expression.names:
                     if hasattr(module, alias.name):
                         state[alias.asname or alias.name] = getattr(module, alias.name)
@@ -1492,151 +1625,205 @@ def evaluate_ast(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str] = BASE_BUILTIN_MODULES,
 ):
-    """
-    Evaluate an abstract syntax tree using the content of the variables stored in a state and only evaluating a given
-    set of functions.
+    """AST 解释器的核心调度器 —— 根据节点类型分发到对应的 evaluate_xxx 函数。
 
-    This function will recurse through the nodes of the tree provided.
+    这是一个递归函数：复杂的节点（如赋值、函数调用）内部会再次调用 evaluate_ast 处理子表达式。
+    例如 `result = len(data)` 的执行过程：
+        evaluate_ast(Assign)
+          → evaluate_assign()
+            → evaluate_ast(Call)          # 先算右边的 len(data)
+              → evaluate_call()
+                → evaluate_ast(Name)      # 算参数 data
+                  → 从 state 中查找 data 的值
+                → 调用 len(data的值)
+            → state["result"] = 结果
 
     Args:
-        expression (`ast.AST`):
-            The code to evaluate, as an abstract syntax tree.
-        state (`Dict[str, Any]`):
-            A dictionary mapping variable names to values. The `state` is updated if need be when the evaluation
-            encounters assignments.
-        static_tools (`Dict[str, Callable]`):
-            Functions that may be called during the evaluation. Trying to change one of these static_tools will raise an error.
-        custom_tools (`Dict[str, Callable]`):
-            Functions that may be called during the evaluation. These custom_tools can be overwritten.
-        authorized_imports (`List[str]`):
-            The list of modules that can be imported by the code. By default, only a few safe modules are allowed.
-            If it contains "*", it will authorize any import. Use this at your own risk!
+        expression: 一个 AST 节点（ast.Assign, ast.Call, ast.Name 等）
+        state: 变量存储字典（跨步骤持久化）
+        static_tools: 不可覆盖的工具函数（Agent 工具 + 内置安全函数）
+        custom_tools: 可覆盖的工具函数
+        authorized_imports: 导入白名单
     """
+    # ===== 操作计数：防止无限循环 =====
     if state.setdefault("_operations_count", {"counter": 0})["counter"] >= MAX_OPERATIONS:
         raise InterpreterError(
             f"Reached the max number of operations of {MAX_OPERATIONS}. Maybe there is an infinite loop somewhere in the code, or you're just asking too many calculations."
         )
     state["_operations_count"]["counter"] += 1
     common_params = (state, static_tools, custom_tools, authorized_imports)
+
+    # ===== 第1组：赋值语句 =====
     if isinstance(expression, ast.Assign):
-        # Assignment -> we evaluate the assignment which should update the state
-        # We return the variable assigned as it may be used to determine the final result.
+        # x = 10, a, b = 1, 2 → 计算右边的值，存入 state
         return evaluate_assign(expression, *common_params)
     elif isinstance(expression, ast.AnnAssign):
+        # x: int = 10 → 带类型注解的赋值
         return evaluate_annassign(expression, *common_params)
     elif isinstance(expression, ast.AugAssign):
+        # x += 1, count -= 1 → 增量赋值
         return evaluate_augassign(expression, *common_params)
+
+    # ===== 第2组：函数调用 =====
     elif isinstance(expression, ast.Call):
-        # Function call -> we return the value of the function call
+        # web_search("hello"), len(data), print(x) → 最复杂的一个
         return evaluate_call(expression, *common_params)
+
+    # ===== 第3组：字面量和容器 =====
     elif isinstance(expression, ast.Constant):
-        # Constant -> just return the value
+        # 42, "hello", True, None → 直接返回值
         return expression.value
     elif isinstance(expression, ast.Tuple):
+        # (1, 2, 3) → 递归算每个元素
         return tuple((evaluate_ast(elt, *common_params) for elt in expression.elts))
-    elif isinstance(expression, ast.GeneratorExp):
-        return evaluate_generatorexp(expression, *common_params)
-    elif isinstance(expression, ast.ListComp):
-        return evaluate_listcomp(expression, *common_params)
-    elif isinstance(expression, ast.DictComp):
-        return evaluate_dictcomp(expression, *common_params)
-    elif isinstance(expression, ast.SetComp):
-        return evaluate_setcomp(expression, *common_params)
-    elif isinstance(expression, ast.UnaryOp):
-        return evaluate_unaryop(expression, *common_params)
-    elif isinstance(expression, ast.Starred):
-        return evaluate_ast(expression.value, *common_params)
-    elif isinstance(expression, ast.BoolOp):
-        # Boolean operation -> evaluate the operation
-        return evaluate_boolop(expression, *common_params)
-    elif isinstance(expression, ast.Break):
-        raise BreakException()
-    elif isinstance(expression, ast.Continue):
-        raise ContinueException()
-    elif isinstance(expression, ast.BinOp):
-        # Binary operation -> execute operation
-        return evaluate_binop(expression, *common_params)
-    elif isinstance(expression, ast.Compare):
-        # Comparison -> evaluate the comparison
-        return evaluate_condition(expression, *common_params)
-    elif isinstance(expression, ast.Lambda):
-        return evaluate_lambda(expression, *common_params)
-    elif isinstance(expression, ast.FunctionDef):
-        return evaluate_function_def(expression, *common_params)
+    elif isinstance(expression, ast.List):
+        # [1, 2, 3] → 递归算每个元素
+        return [evaluate_ast(elt, *common_params) for elt in expression.elts]
     elif isinstance(expression, ast.Dict):
-        # Dict -> evaluate all keys and values
+        # {"a": 1} → 递归算每个 key 和 value
         keys = (evaluate_ast(k, *common_params) for k in expression.keys)
         values = (evaluate_ast(v, *common_params) for v in expression.values)
         return dict(zip(keys, values))
-    elif isinstance(expression, ast.Expr):
-        # Expression -> evaluate the content
+    elif isinstance(expression, ast.Set):
+        # {1, 2, 3} → 递归算每个元素
+        return set((evaluate_ast(elt, *common_params) for elt in expression.elts))
+
+    # ===== 第4组：推导式和生成器 =====
+    elif isinstance(expression, ast.GeneratorExp):
+        # (x for x in range(10))
+        return evaluate_generatorexp(expression, *common_params)
+    elif isinstance(expression, ast.ListComp):
+        # [x*2 for x in range(10)]
+        return evaluate_listcomp(expression, *common_params)
+    elif isinstance(expression, ast.DictComp):
+        # {k: v for k, v in items}
+        return evaluate_dictcomp(expression, *common_params)
+    elif isinstance(expression, ast.SetComp):
+        # {x for x in range(10)}
+        return evaluate_setcomp(expression, *common_params)
+
+    # ===== 第5组：运算符 =====
+    elif isinstance(expression, ast.UnaryOp):
+        # -x, not flag, ~n → 一元运算
+        return evaluate_unaryop(expression, *common_params)
+    elif isinstance(expression, ast.BinOp):
+        # x + y, a * b → 二元运算
+        return evaluate_binop(expression, *common_params)
+    elif isinstance(expression, ast.BoolOp):
+        # a and b, x or y → 布尔运算（支持短路求值）
+        return evaluate_boolop(expression, *common_params)
+    elif isinstance(expression, ast.Compare):
+        # x > 5, a == b, 1 < x < 10 → 比较运算
+        return evaluate_condition(expression, *common_params)
+    elif isinstance(expression, ast.Starred):
+        # *args → 解包运算符
         return evaluate_ast(expression.value, *common_params)
-    elif isinstance(expression, ast.For):
-        # For loop -> execute the loop
-        return evaluate_for(expression, *common_params)
-    elif isinstance(expression, ast.FormattedValue):
-        # Formatted value (part of f-string) -> evaluate the content and format it
-        value = evaluate_ast(expression.value, *common_params)
-        # Early return if no format spec
-        if not expression.format_spec:
-            return value
-        # Apply format specification
-        format_spec = evaluate_ast(expression.format_spec, *common_params)
-        return format(value, format_spec)
+
+    # ===== 第6组：控制流 =====
     elif isinstance(expression, ast.If):
-        # If -> execute the right branch
+        # if/elif/else
         return evaluate_if(expression, *common_params)
-    elif hasattr(ast, "Index") and isinstance(expression, ast.Index):
-        return evaluate_ast(expression.value, *common_params)
-    elif isinstance(expression, ast.JoinedStr):
-        return "".join([str(evaluate_ast(v, *common_params)) for v in expression.values])
-    elif isinstance(expression, ast.List):
-        # List -> evaluate all elements
-        return [evaluate_ast(elt, *common_params) for elt in expression.elts]
-    elif isinstance(expression, ast.Name):
-        # Name -> pick up the value in the state
-        return evaluate_name(expression, *common_params)
-    elif isinstance(expression, ast.Subscript):
-        # Subscript -> return the value of the indexing
-        return evaluate_subscript(expression, *common_params)
     elif isinstance(expression, ast.IfExp):
+        # x if condition else y → 三元表达式
         test_val = evaluate_ast(expression.test, *common_params)
         if test_val:
             return evaluate_ast(expression.body, *common_params)
         else:
             return evaluate_ast(expression.orelse, *common_params)
+    elif isinstance(expression, ast.For):
+        # for 循环
+        return evaluate_for(expression, *common_params)
+    elif isinstance(expression, ast.While):
+        # while 循环
+        return evaluate_while(expression, *common_params)
+    elif isinstance(expression, ast.Break):
+        # break → 用异常模拟，由 evaluate_for/evaluate_while 的 except 捕获
+        raise BreakException()
+    elif isinstance(expression, ast.Continue):
+        # continue → 用异常模拟，跳到下一次迭代
+        raise ContinueException()
+    elif isinstance(expression, ast.Return):
+        # return → 用异常模拟，由 create_function 中的 except 捕获
+        raise ReturnException(evaluate_ast(expression.value, *common_params) if expression.value else None)
+    elif isinstance(expression, ast.Pass):
+        # pass → 什么都不做
+        return None
+
+    # ===== 第7组：函数和类定义 =====
+    elif isinstance(expression, ast.FunctionDef):
+        # def my_func(): ... → 在沙箱中创建函数
+        return evaluate_function_def(expression, *common_params)
+    elif isinstance(expression, ast.Lambda):
+        # lambda x: x + 1
+        return evaluate_lambda(expression, *common_params)
+    elif isinstance(expression, ast.ClassDef):
+        # class MyClass: ... → 在沙箱中创建类
+        return evaluate_class_def(expression, *common_params)
+
+    # ===== 第8组：属性访问和索引 =====
+    elif isinstance(expression, ast.Name):
+        # 变量名 result, x, data → 从 state 中查找值
+        return evaluate_name(expression, *common_params)
     elif isinstance(expression, ast.Attribute):
+        # obj.name, data.items() → 属性访问（dunder 属性会被拦截）
         return evaluate_attribute(expression, *common_params)
+    elif isinstance(expression, ast.Subscript):
+        # data[0], dict["key"], arr[1:3] → 索引/切片
+        return evaluate_subscript(expression, *common_params)
     elif isinstance(expression, ast.Slice):
+        # 切片对象 1:3, ::2 → 构造 slice 对象
         return slice(
             evaluate_ast(expression.lower, *common_params) if expression.lower is not None else None,
             evaluate_ast(expression.upper, *common_params) if expression.upper is not None else None,
             evaluate_ast(expression.step, *common_params) if expression.step is not None else None,
         )
-    elif isinstance(expression, ast.While):
-        return evaluate_while(expression, *common_params)
+    elif hasattr(ast, "Index") and isinstance(expression, ast.Index):
+        # Python 3.8 兼容：旧版本的索引节点
+        return evaluate_ast(expression.value, *common_params)
+
+    # ===== 第9组：字符串格式化 =====
+    elif isinstance(expression, ast.JoinedStr):
+        # f"hello {name}" → f-string，拼接所有部分
+        return "".join([str(evaluate_ast(v, *common_params)) for v in expression.values])
+    elif isinstance(expression, ast.FormattedValue):
+        # f-string 中的 {name:.2f} → 计算值并应用格式
+        value = evaluate_ast(expression.value, *common_params)
+        if not expression.format_spec:
+            return value
+        format_spec = evaluate_ast(expression.format_spec, *common_params)
+        return format(value, format_spec)
+
+    # ===== 第10组：表达式语句 =====
+    elif isinstance(expression, ast.Expr):
+        # 纯表达式语句（如单独一行 print(x)）→ 剥掉 Expr 壳，递归处理内容
+        return evaluate_ast(expression.value, *common_params)
+
+    # ===== 第11组：import（安全检查的关键入口） =====
     elif isinstance(expression, (ast.Import, ast.ImportFrom)):
+        # import json, from math import sqrt → 白名单检查
         return evaluate_import(expression, state, authorized_imports)
-    elif isinstance(expression, ast.ClassDef):
-        return evaluate_class_def(expression, *common_params)
+
+    # ===== 第12组：异常处理 =====
     elif isinstance(expression, ast.Try):
+        # try/except/finally
         return evaluate_try(expression, *common_params)
     elif isinstance(expression, ast.Raise):
+        # raise ValueError("xxx")
         return evaluate_raise(expression, *common_params)
     elif isinstance(expression, ast.Assert):
+        # assert x > 0
         return evaluate_assert(expression, *common_params)
+
+    # ===== 第13组：上下文管理器和删除 =====
     elif isinstance(expression, ast.With):
+        # with open(...) as f: → 上下文管理器
         return evaluate_with(expression, *common_params)
-    elif isinstance(expression, ast.Set):
-        return set((evaluate_ast(elt, *common_params) for elt in expression.elts))
-    elif isinstance(expression, ast.Return):
-        raise ReturnException(evaluate_ast(expression.value, *common_params) if expression.value else None)
-    elif isinstance(expression, ast.Pass):
-        return None
     elif isinstance(expression, ast.Delete):
+        # del x → 从 state 中删除变量
         return evaluate_delete(expression, *common_params)
+
+    # ===== 兜底：不支持的语法一律拒绝 =====
     else:
-        # For now we refuse anything else. Let's add things as we need them.
         raise InterpreterError(f"{expression.__class__.__name__} is not supported.")
 
 
