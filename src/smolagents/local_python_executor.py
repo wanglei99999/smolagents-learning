@@ -965,7 +965,7 @@ def evaluate_call(
         obj.method(x)             → ast.Attribute 方法调用
         get_func()("hello")      → ast.Call 链式调用
         (lambda x: x+1)(5)       → ast.Lambda 调用
-        funcs[0]("hello")        → ast.Subscript 索引调用
+        funcs[0]("hello")        → ast.Subscript(下表取值) 索引调用
 
     执行流程：1.找到函数 → 2.计算参数 → 3.安全检查 → 4.调用
     """
@@ -977,7 +977,7 @@ def evaluate_call(
     func, func_name = None, None
 
     # ===== 第1步：根据调用形式找到函数对象（func） =====
-
+    # 因为call节点内部还包装着其它节点
     if isinstance(call.func, ast.Call):
         # 链式调用：get_func()("hello") → 先递归执行 get_func() 拿到返回的函数
         func = evaluate_ast(call.func, state, static_tools, custom_tools, authorized_imports)
