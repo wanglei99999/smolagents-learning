@@ -1801,7 +1801,7 @@ class ToolCallingAgent(MultiStepAgent):
     def process_tool_calls(
         self, chat_message: ChatMessage, memory_step: ActionStep
     ) -> Generator[ToolCall | ToolOutput]:
-        """处理 LLM 输出的工具调用请求，并更新 Agent 记忆。
+        """处理 LLM 输出的工具调用请求，并更新 Agent 记忆。 
         
         这个方法负责：
         1. 解析 LLM 输出中的所有工具调用请求
