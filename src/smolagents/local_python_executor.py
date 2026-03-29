@@ -450,7 +450,7 @@ def check_import_authorized(import_to_check: str, authorized_imports: list[str])
         current_node = current_node[part]
     return True
 
-
+#属性访问解释器
 def evaluate_attribute(
     expression: ast.Attribute,
     state: dict[str, Any],
@@ -458,12 +458,13 @@ def evaluate_attribute(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
+    #这个叫拦截dunder属性，dunder属性是指双下划线开头的属性。用来防止危险方法访问
     if expression.attr.startswith("__") and expression.attr.endswith("__"):
         raise InterpreterError(f"Forbidden access to dunder attribute: {expression.attr}")
     value = evaluate_ast(expression.value, state, static_tools, custom_tools, authorized_imports)
     return getattr(value, expression.attr)
 
-
+#处理一元运算符的
 def evaluate_unaryop(
     expression: ast.UnaryOp,
     state: dict[str, Any],
@@ -483,7 +484,7 @@ def evaluate_unaryop(
     else:
         raise InterpreterError(f"Unary operation {expression.op.__class__.__name__} is not supported.")
 
-
+#处理匿名表达式的
 def evaluate_lambda(
     lambda_expression: ast.Lambda,
     state: dict[str, Any],
