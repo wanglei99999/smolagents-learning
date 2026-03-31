@@ -566,6 +566,7 @@ def create_function(
         defaults = dict(zip(arg_names[-len(default_values) :], default_values))
 
         # 绑定位置参数：func("hello", 5) → func_state["data"] = "hello", func_state["count"] = 5
+        # arg_name是名字，args是实际参数
         for name, value in zip(arg_names, args):
             func_state[name] = value
 
@@ -597,6 +598,7 @@ def create_function(
         # ===== 执行函数体 =====
         result = None
         try:
+            #执行函数体，放到我们的evaluate_ast系统中
             for stmt in func_def.body:
                 result = evaluate_ast(stmt, func_state, static_tools, custom_tools, authorized_imports)
         except ReturnException as e:
@@ -613,7 +615,7 @@ def create_function(
     new_func.__ast__ = func_def
     new_func.__source__ = source_code
     new_func.__name__ = func_def.name
-
+    #返回一个可调用对象
     return new_func
 
 
@@ -641,11 +643,16 @@ def evaluate_class_def(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> type:
+    # class Person(Base): ...
+    # class_def.name 就是 "Person"
     class_name = class_def.name
+
+    # 先把父类节点递归求值成真正的类对象。
+    # 例如 class Dog(Animal): ... 这里会把 Name("Animal") 解析成 Animal 类本身。
     bases = [evaluate_ast(base, state, static_tools, custom_tools, authorized_imports) for base in class_def.bases]
 
-    # Determine the metaclass to use
-    # If any base class has a custom metaclass, use it
+    # 决定用哪个 metaclass 来创建最终的类对象。
+    # 默认所有普通类都由 type 创建；如果父类里有自定义 metaclass，就沿用它。
     metaclass = type
     for base in bases:
         base_metaclass = type(base)
@@ -653,35 +660,43 @@ def evaluate_class_def(
             metaclass = base_metaclass
             break
 
-    # Use __prepare__ if the metaclass provides it (e.g., Enum uses _EnumDict)
+    # 类体在真正变成类之前，会先执行到一个“类命名空间”里。
+    # 大多数时候这个命名空间就是 dict；有些 metaclass 会通过 __prepare__ 自定义它。
     if hasattr(metaclass, "__prepare__"):
         class_dict = metaclass.__prepare__(class_name, bases)
     else:
         class_dict = {}
 
+    # 逐条处理类体里的语句，把方法、类属性、注解等都收集到 class_dict 中。
     for stmt in class_def.body:
         if isinstance(stmt, ast.FunctionDef):
+            # def method(...): ...
+            # 方法先按普通函数去创建，随后作为类属性挂到 class_dict 上。
             class_dict[stmt.name] = evaluate_ast(stmt, state, static_tools, custom_tools, authorized_imports)
         elif isinstance(stmt, ast.AnnAssign):
+            # 处理带类型注解的类属性，例如:
+            #   age: int = 18
+            #   name: str
             if stmt.value:
                 value = evaluate_ast(stmt.value, state, static_tools, custom_tools, authorized_imports)
             target = stmt.target
-            # Handle target types for annotation
+            # 按左侧目标的不同形态分别处理。
             if isinstance(target, ast.Name):
-                # Simple variable annotation like "x: int"
+                # 简单类属性注解: x: int = 1
                 annotation = evaluate_ast(stmt.annotation, state, static_tools, custom_tools, authorized_imports)
+                #这里可以得到：class_dict["__annotations__"]["age"] = int
                 class_dict.setdefault("__annotations__", {})[target.id] = annotation
-                # Assign value if provided
+                # 如果还带默认值，就把值也写入类命名空间。
                 if stmt.value:
                     class_dict[target.id] = value
             elif isinstance(target, ast.Attribute):
-                # Attribute annotation like "obj.attr: int"
+                # 属性注解，例如 obj.attr: int = 1
+                # 属性的内容不存dict，因为不是自己的值
                 obj = evaluate_ast(target.value, class_dict, static_tools, custom_tools, authorized_imports)
-                # If there's a value assignment, set the attribute
                 if stmt.value:
                     setattr(obj, target.attr, value)
             elif isinstance(target, ast.Subscript):
-                # Subscript annotation like "dict[key]: int"
+                # 下标注解，例如 mapping[key]: int = 1
                 container = evaluate_ast(target.value, class_dict, static_tools, custom_tools, authorized_imports)
                 index = evaluate_ast(target.slice, state, static_tools, custom_tools, authorized_imports)
                 # If there's a value assignment, set the item
@@ -690,6 +705,8 @@ def evaluate_class_def(
             else:
                 raise InterpreterError(f"Unsupported AnnAssign target in class body: {type(target).__name__}")
         elif isinstance(stmt, ast.Assign):
+            # 处理普通类属性赋值，例如:
+            #   kind = "human"
             value = evaluate_ast(stmt.value, state, static_tools, custom_tools, authorized_imports)
             for target in stmt.targets:
                 if isinstance(target, ast.Name):
@@ -698,6 +715,7 @@ def evaluate_class_def(
                     obj = evaluate_ast(target.value, class_dict, static_tools, custom_tools, authorized_imports)
                     setattr(obj, target.attr, value)
         elif isinstance(stmt, ast.Pass):
+            # 空类体或占位 pass，直接跳过。
             pass
         elif (
             isinstance(stmt, ast.Expr)
@@ -705,12 +723,15 @@ def evaluate_class_def(
             and isinstance(stmt.value, ast.Constant)
             and isinstance(stmt.value.value, str)
         ):
-            # Check if it is a docstring: first statement in class body which is a string literal expression
+            # 类体第一条如果是字符串常量，就把它当作类的 docstring。
             class_dict["__doc__"] = stmt.value.value
         else:
+            # 为了保持解释器可控，类体里只支持上面列出的几类语句。
             raise InterpreterError(f"Unsupported statement in class body: {stmt.__class__.__name__}")
 
+    # 最后调用 metaclass(name, bases, namespace) 真正造出类对象。
     new_class = metaclass(class_name, tuple(bases), class_dict)
+    # 把类名注册到当前 state，后续代码才能直接使用 Person、MyClass 这样的名字。
     state[class_name] = new_class
     return new_class
 
@@ -821,16 +842,19 @@ def evaluate_boolop(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
-    # Determine which value should trigger short-circuit based on operation type:
-    # - 'and' returns the first falsy value encountered (or the last value if all are truthy)
-    # - 'or' returns the first truthy value encountered (or the last value if all are falsy)
+    # Python 的 and/or 不是简单返回 True/False，而是返回参与运算的“原值”之一。
+    # and: 遇到第一个 falsy 值就短路返回；如果都为 truthy，则返回最后一个值。
+    # or: 遇到第一个 truthy 值就短路返回；如果都为 falsy，则返回最后一个值。
     is_short_circuit_value = (lambda x: not x) if isinstance(node.op, ast.And) else (lambda x: bool(x))
+
+    # 按从左到右顺序依次求值，模拟 Python 的短路行为。
     for value in node.values:
         result = evaluate_ast(value, state, static_tools, custom_tools, authorized_imports)
-        # Short-circuit: return immediately if the condition is met
+        # 一旦遇到当前运算符的短路值，就立刻返回，后面的表达式不再执行。
         if is_short_circuit_value(result):
             return result
-    # If no short-circuit occurred, return the last evaluated value
+
+    # 如果整个链条都没有提前短路，结果就是最后一个被求值的原始值。
     return result
 
 
@@ -841,11 +865,14 @@ def evaluate_binop(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
-    # Recursively evaluate the left and right operands
+    # 二元运算的通用套路是：
+    # 1. 先递归求左操作数
+    # 2. 再递归求右操作数
+    # 3. 最后根据运算符类型执行真正的 Python 运算
     left_val = evaluate_ast(binop.left, state, static_tools, custom_tools, authorized_imports)
     right_val = evaluate_ast(binop.right, state, static_tools, custom_tools, authorized_imports)
 
-    # Determine the operation based on the type of the operator in the BinOp
+    # 根据 AST 中记录的运算符节点类型，分发到对应的实际运算。
     if isinstance(binop.op, ast.Add):
         return left_val + right_val
     elif isinstance(binop.op, ast.Sub):
@@ -871,6 +898,7 @@ def evaluate_binop(
     elif isinstance(binop.op, ast.RShift):
         return left_val >> right_val
     else:
+        # 没有显式支持的二元运算一律视为未实现。
         raise NotImplementedError(f"Binary operation {type(binop.op).__name__} is not implemented.")
 
 
@@ -1048,6 +1076,7 @@ def evaluate_call(
 
     if func_name == "super":
         # 特殊处理 super()：需要从 state 中获取当前类和实例
+        #三个super分别是 super(),super(class), super(class,obj)
         if not args:
             if "__class__" in state and "self" in state:
                 return super(state["__class__"], state["self"])
@@ -1099,16 +1128,31 @@ def evaluate_subscript(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
+    # 先计算方括号里的内容，比如:
+    # data[0]        -> index 是 0
+    # data["name"]   -> index 是 "name"
+    # text[1:3]      -> index 是 slice(1, 3, None)
+    # 再计算被索引的对象，比如:
+    # data[0] 里的 data
+    # info["x"] 里的 info
     index = evaluate_ast(subscript.slice, state, static_tools, custom_tools, authorized_imports)
     value = evaluate_ast(subscript.value, state, static_tools, custom_tools, authorized_imports)
     try:
         return value[index]
+    # 下面几种错误都说明“索引失败了”
+    # KeyError: 字典里没有这个 key
+    # IndexError: 列表/元组下标越界
+    # TypeError: 对不支持索引的对象用了 []
     except (KeyError, IndexError, TypeError) as e:
         error_message = f"Could not index {value} with '{index}': {type(e).__name__}: {e}"
+        # 如果是“字典 + 字符串 key”的场景，
+        # 顺便帮用户做一个近似匹配提示
+        # 例如写成 data['nmae']，可能提示 data['name']
         if isinstance(index, str) and isinstance(value, Mapping):
             close_matches = difflib.get_close_matches(index, list(value.keys()))
             if len(close_matches) > 0:
                 error_message += f". Maybe you meant one of these indexes instead: {str(close_matches)}"
+         # 把底层 Python 异常包装成解释器自己的错误类型
         raise InterpreterError(error_message) from e
 
 
@@ -1140,10 +1184,19 @@ def evaluate_condition(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> bool | object:
+    # Compare 节点既能表示简单比较：
+    #   x > 1
+    # 也能表示链式比较：
+    #   1 < x < 10
+    # Python 的链式比较不是拆成两个互不相关的表达式，而是要按顺序逐段比较。
     result = True
+
+    # 先求最左边的值，后面会不断把 right 滚动到下一轮的 left。
     left = evaluate_ast(condition.left, state, static_tools, custom_tools, authorized_imports)
     for i, (op, comparator) in enumerate(zip(condition.ops, condition.comparators)):
         op = type(op)
+
+        # 当前比较链这一段的右操作数。
         right = evaluate_ast(comparator, state, static_tools, custom_tools, authorized_imports)
         if op == ast.Eq:
             current_result = left == right
@@ -1168,9 +1221,17 @@ def evaluate_condition(
         else:
             raise InterpreterError(f"Unsupported comparison operator: {op}")
 
+        # 链式比较中只要有一段失败，整个比较立即为 False。
         if current_result is False:
             return False
+
+        # 记录当前阶段比较结果。对于链式比较，所有阶段都必须成立。
         result = current_result if i == 0 else (result and current_result)
+
+        # 链式比较的关键：
+        #   1 < x < 10
+        # 在比较完 1 < x 之后，下一轮要继续比较 x < 10，
+        # 所以把当前的 right 变成下一轮的 left。
         left = right
     return result
 
@@ -1182,14 +1243,26 @@ def evaluate_if(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
+    # ast.If 对应:
+    #   if cond:
+    #       ...
+    #   else:
+    #       ...
+    #
+    # 解释器要先求条件，再决定执行 body 还是 orelse。
     result = None
+
+    # 先计算 if 条件。
     test_result = evaluate_ast(if_statement.test, state, static_tools, custom_tools, authorized_imports)
     if test_result:
+        # 条件为真时，顺序执行 if 分支。
         for line in if_statement.body:
             line_result = evaluate_ast(line, state, static_tools, custom_tools, authorized_imports)
+            # 记录最近一个非 None 的语句结果，作为整个 if 语句的返回值候选。
             if line_result is not None:
                 result = line_result
     else:
+        # 条件为假时，顺序执行 else / elif 对应的 orelse 分支。
         for line in if_statement.orelse:
             line_result = evaluate_ast(line, state, static_tools, custom_tools, authorized_imports)
             if line_result is not None:
@@ -1204,9 +1277,19 @@ def evaluate_for(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Any:
+    # ast.For 对应:
+    #   for target in iterable:
+    #       ...
+    #
+    # 解释器需要先求值 iterable，再把每轮迭代值绑定到 target 上，最后执行循环体。
     result = None
+
+    # 先计算 for ... in ... 里的迭代对象。
     iterator = evaluate_ast(for_loop.iter, state, static_tools, custom_tools, authorized_imports)
     for counter in iterator:
+        # 把当前这一轮的值写入循环变量目标。
+        # target 可能不只是简单名字，也可能是解包目标，例如:
+        #   for a, b in pairs:
         set_value(
             for_loop.target,
             counter,
@@ -1215,14 +1298,18 @@ def evaluate_for(
             custom_tools,
             authorized_imports,
         )
+
+        # 顺序执行循环体中的每条语句。
         for node in for_loop.body:
             try:
                 line_result = evaluate_ast(node, state, static_tools, custom_tools, authorized_imports)
                 if line_result is not None:
                     result = line_result
             except BreakException:
+                # break: 立即结束整个 for 循环。
                 return result
             except ContinueException:
+                # continue: 结束当前这一轮，进入下一轮迭代。
                 break
     return result
 
@@ -1249,22 +1336,34 @@ def _evaluate_comprehensions(
     Yields:
         `Any`: Individual elements produced by the comprehension
     """
-    # Base case: no more comprehensions
+    # 这是推导式共享的递归“展开器”。
+    # 它把:
+    #   [x * 2 for x in xs if x > 0 for y in ys]
+    # 这类结构拆成“逐层 for + if 过滤 + 最终元素求值”的递归过程。
+
+    # 递归终点：如果没有剩余的 comprehension 生成器了，
+    # 说明所有 for/if 条件都已经满足，此时真正计算最终元素并产出。
     if not comprehensions:
         yield evaluate_element(state)
         return
-    # Evaluate first comprehension
+
+    # 每次只处理当前最外层的一个 comprehension，
+    # 剩余层级交给递归继续展开。
     comprehension = comprehensions[0]
     iter_value = evaluate_ast(comprehension.iter, state, static_tools, custom_tools, authorized_imports)
     for value in iter_value:
+        # 推导式每一轮都基于当前状态的副本执行，
+        # 避免中间绑定的循环变量直接污染外层 state。
         new_state = state.copy()
         set_value(comprehension.target, value, new_state, static_tools, custom_tools, authorized_imports)
-        # Check all filter conditions
+
+        # 这一层 comprehension 可能自带若干 if 过滤条件，
+        # 只有全部满足，才继续进入下一层递归。
         if all(
             evaluate_ast(if_clause, new_state, static_tools, custom_tools, authorized_imports)
             for if_clause in comprehension.ifs
         ):
-            # Recurse with remaining comprehensions
+            # 当前层满足后，继续展开剩余 generators。
             yield from _evaluate_comprehensions(
                 comprehensions[1:], evaluate_element, new_state, static_tools, custom_tools, authorized_imports
             )
@@ -1277,6 +1376,9 @@ def evaluate_listcomp(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> list[Any]:
+    # 列表推导式本质上就是：
+    # 1. 用 _evaluate_comprehensions 逐个生成元素
+    # 2. 最后收集成 list
     return list(
         _evaluate_comprehensions(
             listcomp.generators,
@@ -1296,6 +1398,8 @@ def evaluate_setcomp(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> set[Any]:
+    # 集合推导式和列表推导式共享同一套展开逻辑，
+    # 唯一差别只是最后把结果收集成 set。
     return set(
         _evaluate_comprehensions(
             setcomp.generators,
@@ -1315,6 +1419,8 @@ def evaluate_dictcomp(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> dict[Any, Any]:
+    # 字典推导式同样复用统一展开逻辑，
+    # 只是最终元素不再是单个值，而是 (key, value) 二元组。
     return dict(
         _evaluate_comprehensions(
             dictcomp.generators,
