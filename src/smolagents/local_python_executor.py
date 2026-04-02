@@ -1343,6 +1343,23 @@ def _evaluate_comprehensions(
 
     # 递归终点：如果没有剩余的 comprehension 生成器了，
     # 说明所有 for/if 条件都已经满足，此时真正计算最终元素并产出。
+    # def _evaluate_comprehensions(comprehensions, evaluate_element, state):
+    # if 没有剩余循环层了:
+    #     yield evaluate_element(state)
+    #     return
+
+    # 当前层 = comprehensions[0]
+
+    # for 当前值 in 当前层的可迭代对象:
+    #     new_state = state.copy()
+    #     把 当前值 绑定到 当前层目标变量 上
+
+    #     if 当前层所有 if 条件都成立:
+    #         yield from _evaluate_comprehensions(
+    #             剩余循环层,
+    #             evaluate_element,
+    #             new_state,
+    #         )
     if not comprehensions:
         yield evaluate_element(state)
         return
@@ -1443,29 +1460,43 @@ def evaluate_try(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> None:
+    # try/except/else/finally 的整体结构可以先理解成：
+    # 1. 先执行 try 块
+    # 2. 如果抛异常，就按顺序匹配 except 分支
+    # 3. 如果 try 块完全没异常，再执行 else
+    # 4. 最后无论如何都执行 finally
     try:
+        # 先顺序执行 try body 中的每条语句。
         for stmt in try_node.body:
             evaluate_ast(stmt, state, static_tools, custom_tools, authorized_imports)
     except Exception as e:
+        # try 中出现异常后，按源码顺序寻找第一个匹配的 except handler。
         matched = False
         for handler in try_node.handlers:
+            # handler.type is None 对应裸 except:，即捕获任意异常。
+            # 否则先把 except 后面的异常类型表达式求值，再用 isinstance 判断是否匹配。
             if handler.type is None or isinstance(
                 e,
                 evaluate_ast(handler.type, state, static_tools, custom_tools, authorized_imports),
             ):
                 matched = True
+                # except SomeError as err: 中的 err 绑定到当前 state。
                 if handler.name:
                     state[handler.name] = e
+                # 命中后执行这个 except 分支的语句，并停止继续匹配后续 handlers。
                 for stmt in handler.body:
                     evaluate_ast(stmt, state, static_tools, custom_tools, authorized_imports)
                 break
+        # 没有任何 except 命中，则把原异常继续向外抛出。
         if not matched:
             raise e
     else:
+        # 只有 try 块完全没有异常时，才会执行 else。
         if try_node.orelse:
             for stmt in try_node.orelse:
                 evaluate_ast(stmt, state, static_tools, custom_tools, authorized_imports)
     finally:
+        # finally 总会执行，不管前面是正常结束、被 except 捕获，还是继续向外抛异常。
         if try_node.finalbody:
             for stmt in try_node.finalbody:
                 evaluate_ast(stmt, state, static_tools, custom_tools, authorized_imports)
@@ -1478,20 +1509,30 @@ def evaluate_raise(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> None:
+    # raise 语句有三种常见形态：
+    # 1. raise SomeError(...)
+    # 2. raise SomeError(...) from cause
+    # 3. 裸 raise（重新抛出当前异常）
+    # 这里实现了前两种；第三种因为没有维护“当前活动异常”上下文，所以显式不支持。
     if raise_node.exc is not None:
+        # 先把要抛出的异常表达式求值成真正的异常对象/异常类实例。
         exc = evaluate_ast(raise_node.exc, state, static_tools, custom_tools, authorized_imports)
     else:
         exc = None
     if raise_node.cause is not None:
+        # raise ... from ... 中的 cause 也先递归求值。
         cause = evaluate_ast(raise_node.cause, state, static_tools, custom_tools, authorized_imports)
     else:
         cause = None
     if exc is not None:
         if cause is not None:
+            # 显式异常链：新异常由 cause 导致。
             raise exc from cause
         else:
+            # 普通 raise：直接抛出异常对象。
             raise exc
     else:
+        # 裸 raise 需要“当前正在处理的异常”上下文；这个解释器目前没有单独维护它。
         raise InterpreterError("Re-raise is not supported without an active exception")
 
 
@@ -1502,13 +1543,19 @@ def evaluate_assert(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> None:
+    # assert 语句的核心语义可以理解成：
+    # 1. 先计算断言条件
+    # 2. 条件为真则什么都不做
+    # 3. 条件为假则抛出 AssertionError
     test_result = evaluate_ast(assert_node.test, state, static_tools, custom_tools, authorized_imports)
+    #这里是如果表达式为假的情况，为假进入消息
     if not test_result:
         if assert_node.msg:
+            # assert cond, msg 中的 msg 只有在断言失败时才会求值。
             msg = evaluate_ast(assert_node.msg, state, static_tools, custom_tools, authorized_imports)
             raise AssertionError(msg)
         else:
-            # Include the failing condition in the assertion message
+            # 没有显式消息时，把失败的条件源码拼到错误信息里，方便调试。
             test_code = ast.unparse(assert_node.test)
             raise AssertionError(f"Assertion failed: {test_code}")
 
@@ -1520,18 +1567,32 @@ def evaluate_with(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> None:
+    # with 语句可以先理解成：
+    # 1. 依次求值每个上下文表达式，并调用 __enter__()
+    # 2. 如果写了 "as x"，就把 __enter__ 的返回值绑定到目标变量
+    # 3. 执行 with body
+    # 4. 退出时按从内到外的顺序调用 __exit__()
+    # 5. 如果 body 抛异常，交给 __exit__ 决定是否抑制
     contexts = []
     for item in with_node.items:
+        # 先计算 with 后面的上下文管理器表达式，例如 open(...)。
         context_expr = evaluate_ast(item.context_expr, state, static_tools, custom_tools, authorized_imports)
+        # 进入上下文，拿到 __enter__() 的返回值。
         enter_result = context_expr.__enter__()
         contexts.append(context_expr)
         if item.optional_vars:
+            # 对应 "with ... as name:"，把 enter_result 绑定到目标变量。
+            # 当前实现只直接处理简单名字目标。
             state[item.optional_vars.id] = enter_result
 
     try:
+        # 进入 with body，顺序执行块内语句。
         for stmt in with_node.body:
             evaluate_ast(stmt, state, static_tools, custom_tools, authorized_imports)
     except Exception as e:
+        # body 抛异常后，要按从内到外的顺序调用 __exit__。
+        # exc_info 表示“当前仍在传播的活动异常”；如果某个 __exit__ 返回 True，
+        # 就把它清空，表示异常已经被抑制。
         # exc_info tracks the active exception as we unwind (from innermost context manager)
         # Resetting it to (None, None, None) signals suppression to the remaining outer managers
         exc_info = (type(e), e, e.__traceback__)
@@ -1542,8 +1603,10 @@ def evaluate_with(
             except Exception as exit_exc:
                 exc_info = (type(exit_exc), exit_exc, exit_exc.__traceback__)  # new exc replaces active
         if exc_info[1] is not None:
+            # 还有未被抑制的异常，就继续向外抛出。
             raise exc_info[1].with_traceback(exc_info[2])
     else:
+        # body 正常结束时，也要按从内到外调用 __exit__(None, None, None)。
         for context in reversed(contexts):
             context.__exit__(None, None, None)
 
@@ -1660,11 +1723,19 @@ def evaluate_generatorexp(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> Generator[Any]:
+    #target 目标内容， iter 迭代内容，ifs 判断内容
+    # 生成器表达式的目标不是“立刻收集结果”，而是返回一个可迭代生成器。
+    # 例如：(x * 2 for x in xs if x > 0)
+    # 调用这个函数时先返回 generator()；真正迭代时，内部逻辑才会逐步执行。
     def generator():
+        # 依次处理生成器表达式里的每一层 "for ... in ... if ..."。
         for gen in genexp.generators:
+            # 先求当前层的迭代对象。
             iter_value = evaluate_ast(gen.iter, state, static_tools, custom_tools, authorized_imports)
             for value in iter_value:
+                # 每轮复制一份状态，避免循环变量直接污染外层作用域。
                 new_state = state.copy()
+                # 把当前值绑定到生成器目标变量，例如 x，或 a, b 这样的解包目标。
                 set_value(
                     gen.target,
                     value,
@@ -1673,10 +1744,13 @@ def evaluate_generatorexp(
                     custom_tools,
                     authorized_imports,
                 )
+                # 当前层的所有 if 过滤条件都满足时，才真正产出元素。
                 if all(
                     evaluate_ast(if_clause, new_state, static_tools, custom_tools, authorized_imports)
                     for if_clause in gen.ifs
                 ):
+                    # 与 list/set/dict 推导式不同，这里不是追加到容器，
+                    # 而是把元素一个个 yield 出去，形成惰性求值的生成器。
                     yield evaluate_ast(
                         genexp.elt,
                         new_state,
@@ -1685,6 +1759,7 @@ def evaluate_generatorexp(
                         authorized_imports,
                     )
 
+    # 返回生成器对象本身，而不是立即执行整个表达式。
     return generator()
 
 
@@ -1695,32 +1770,42 @@ def evaluate_delete(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> None:
-    """
-    Evaluate a delete statement (del x, del x[y]).
-
-    Args:
-        delete_node: The AST Delete node to evaluate
-        state: The current state dictionary
-        static_tools: Dictionary of static tools
-        custom_tools: Dictionary of custom tools
-        authorized_imports: List of authorized imports
-    """
+    # del 语句可以先理解成“删除某个左值位置”。
+    # 这里当前只支持两类常见目标：
+    # 1. del x        -> 删除当前作用域里名字 x 的绑定
+    # 2. del obj[i]   -> 删除容器 obj 中下标/键 i 对应的元素
+    #
+    # 注意：del 删除的通常不是“对象本身”，而是某个引用位置。
+    # 比如 del x 只是把 state 里的 x 这个名字删掉；如果别的变量还引用
+    # 同一个对象，那么那个对象依然存在。
     for target in delete_node.targets:
         if isinstance(target, ast.Name):
-            # Handle simple variable deletion (del x)
+            # 情况1：del x
+            # target.id 就是名字字符串，比如 "x"。
             if target.id in state:
                 del state[target.id]
             else:
                 raise InterpreterError(f"Cannot delete name '{target.id}': name is not defined")
         elif isinstance(target, ast.Subscript):
-            # Handle index/key deletion (del x[y])
+            # 情况2：del obj[index]
+            # 先递归求值左边容器和方括号里的下标/键，再执行真正删除。
+            # 例如：
+            #   del arr[0]
+            #   del data["name"]
             obj = evaluate_ast(target.value, state, static_tools, custom_tools, authorized_imports)
             index = evaluate_ast(target.slice, state, static_tools, custom_tools, authorized_imports)
             try:
                 del obj[index]
             except (TypeError, KeyError, IndexError) as e:
+                # TypeError: 对不支持下标删除的对象用了 del obj[index]
+                # KeyError: 字典里没有这个 key
+                # IndexError: 列表/序列索引越界
                 raise InterpreterError(f"Cannot delete index/key: {str(e)}")
         else:
+            # 其余更复杂形式当前不支持，例如：
+            #   del obj.attr
+            #   del a, b
+            # 这再次说明这里实现的是受限版 del，而不是完整 Python del 语义。
             raise InterpreterError(f"Deletion of {type(target).__name__} targets is not supported")
 
 
