@@ -88,6 +88,13 @@ class MCPClient:
         adapter_kwargs: dict[str, Any] | None = None,
         structured_output: bool | None = None,
     ):
+        # MCPClient 的定位不是“自己实现 MCP 协议”，而是做一层桥接：
+        # 1. 接收 MCP 服务端连接参数
+        # 2. 借助 mcpadapt 建立连接
+        # 3. 把 MCP server 暴露出来的能力转换成 smolagents 的 Tool 列表
+        #
+        # 所以它更像“SmolAgents <-> MCP” 之间的门面对象。
+
         # Handle future warning for structured_output default value change
         if structured_output is None:
             warnings.warn(
@@ -106,6 +113,9 @@ class MCPClient:
         except ModuleNotFoundError:
             raise ModuleNotFoundError("Please install 'mcp' extra to use MCPClient: `pip install 'smolagents[mcp]'`")
         if isinstance(server_parameters, dict):
+            # HTTP 类 MCP 的 transport 允许两种：
+            # - streamable-http: 当前推荐
+            # - sse: 老的 HTTP+SSE 兼容模式
             transport = server_parameters.get("transport")
             if transport is None:
                 transport = "streamable-http"
@@ -115,14 +125,19 @@ class MCPClient:
                     f"Unsupported transport: {transport}. Supported transports are 'streamable-http' and 'sse'."
                 )
         adapter_kwargs = adapter_kwargs or {}
+        # 真正的底层连接 / 协议适配都交给 MCPAdapt。
+        # SmolAgentsAdapter 负责把 MCP 工具包装成 smolagents 的 Tool 对象。
         self._adapter = MCPAdapt(
             server_parameters, SmolAgentsAdapter(structured_output=structured_output), **adapter_kwargs
         )
         self._tools: list[Tool] | None = None
+        # 创建对象时就立即建立连接，拿到工具列表。
         self.connect()
 
     def connect(self):
         """Connect to the MCP server and initialize the tools."""
+        # MCPAdapt 本身实现了上下文管理协议。
+        # 这里直接调用 __enter__()，拿到适配好的 Tool 列表。
         self._tools: list[Tool] = self._adapter.__enter__()
 
     def disconnect(
@@ -132,6 +147,7 @@ class MCPClient:
         exc_traceback: TracebackType | None = None,
     ):
         """Disconnect from the MCP server"""
+        # 对称地把退出逻辑委托给 adapter.__exit__()，完成资源清理。
         self._adapter.__exit__(exc_type, exc_value, exc_traceback)
 
     def get_tools(self) -> list[Tool]:
@@ -147,6 +163,8 @@ class MCPClient:
         Returns:
             list[Tool]: The SmolAgents tools available from the MCP server.
         """
+        # 工具列表只在连接建立后可用。
+        # 当前实现返回的是“连接建立时拿到的那一批工具”。
         if self._tools is None:
             raise ValueError(
                 "Couldn't retrieve tools from MCP server, run `mcp_client.connect()` first before accessing `tools`"
@@ -159,6 +177,10 @@ class MCPClient:
         Note that because of the `.connect` in the init, the mcp_client
         is already connected at this point.
         """
+        # 这样可以直接写：
+        #   with MCPClient(...) as tools:
+        #       ...
+        # 调用者拿到的不是 MCPClient 本身，而是已经适配好的 Tool 列表。
         return self._tools
 
     def __exit__(
@@ -168,4 +190,5 @@ class MCPClient:
         exc_traceback: TracebackType | None,
     ):
         """Disconnect from the MCP server."""
+        # 离开 with 代码块时自动断开连接，避免资源泄漏。
         self.disconnect(exc_type, exc_value, exc_traceback)

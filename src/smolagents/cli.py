@@ -43,6 +43,9 @@ leopard_prompt = "How many seconds would it take for a leopard at full speed to 
 
 
 def parse_arguments():
+    # 解析命令行参数。
+    # 这里定义的是 CLI 这一层“允许用户从终端传什么配置”，
+    # 例如 prompt、模型类型、工具列表、额外 import 白名单等。
     parser = argparse.ArgumentParser(description="Run a CodeAgent with all specified parameters")
     parser.add_argument(
         "prompt",
@@ -109,6 +112,8 @@ def parse_arguments():
 
 def interactive_mode():
     """Run the CLI in interactive mode"""
+    # 当用户没有直接在命令行里给 prompt 时，就进入交互模式：
+    # CLI 会一步步询问“要用什么 agent 形式、什么工具、什么模型、什么 prompt”。
     console.print(
         Panel.fit(
             "[bold magenta]🤖 SmolaGents CLI[/]\n[dim]Intelligent agents at your service[/]", border_style="magenta"
@@ -192,6 +197,13 @@ def load_model(
     api_key: str | None = None,
     provider: str | None = None,
 ) -> Model:
+    # 把 CLI 层拿到的字符串配置（model_type / model_id / api_key ...）
+    # 转换成真正的模型对象实例。
+    #
+    # 也就是说：
+    #   "InferenceClientModel" -> InferenceClientModel(...)
+    #   "LiteLLMModel"         -> LiteLLMModel(...)
+    #   "TransformersModel"    -> TransformersModel(...)
     if model_type == "OpenAIModel":
         return OpenAIModel(
             api_key=api_key or os.getenv("FIREWORKS_API_KEY"),
@@ -227,6 +239,12 @@ def run_smolagent(
     provider: str | None = None,
     action_type: str = "code",
 ) -> None:
+    # 这是 CLI 到 Agent 的真正桥梁：
+    # 1. 先加载 .env
+    # 2. 创建模型对象
+    # 3. 把字符串形式的工具名解析成真正 Tool 实例
+    # 4. 根据 action_type 创建 CodeAgent 或 ToolCallingAgent
+    # 5. 最后调用 agent.run(prompt)
     load_dotenv()
 
     model = load_model(model_type, model_id, api_base=api_base, api_key=api_key, provider=provider)
@@ -235,16 +253,21 @@ def run_smolagent(
 
     for tool_name in tools:
         if "/" in tool_name:
+            # 形如 "username/space-name" 的输入被当成 Hugging Face Space 工具。
+            # CLI 会把它转换成 Tool.from_space(...)。
             space_name = tool_name.split("/")[-1].lower().replace("-", "_").replace(".", "_")
             description = f"Tool loaded from Hugging Face Space: {tool_name}"
             available_tools.append(Tool.from_space(space_id=tool_name, name=space_name, description=description))
         else:
+            # 否则就按内置工具名，从 TOOL_MAPPING 里取出对应工具类并实例化。
             if tool_name in TOOL_MAPPING:
                 available_tools.append(TOOL_MAPPING[tool_name]())
             else:
                 raise ValueError(f"Tool {tool_name} is not recognized either as a default tool or a Space.")
 
     if action_type == "code":
+        # code 模式：创建 CodeAgent。
+        # 这一路最终会走到 LocalPythonExecutor / evaluate_python_code / evaluate_ast。
         agent = CodeAgent(
             tools=available_tools,
             model=model,
@@ -252,14 +275,21 @@ def run_smolagent(
             stream_outputs=True,
         )
     elif action_type == "tool_calling":
+        # tool_calling 模式：创建 ToolCallingAgent。
+        # 这一路更偏向“模型直接决定调用哪个工具”，而不是先生成 Python 代码。
         agent = ToolCallingAgent(tools=available_tools, model=model, stream_outputs=True)
     else:
         raise ValueError(f"Unsupported action type: {action_type}")
 
+    # 真正启动 agent 执行用户任务。
     agent.run(prompt)
 
 
 def main() -> None:
+    # CLI 总入口。
+    # 用法上可以分成两种：
+    # 1. 直接命令行传 prompt 和配置 -> 非交互模式
+    # 2. 不传 prompt                 -> 进入 interactive_mode() 逐步询问
     args = parse_arguments()
 
     # Check if we should run in interactive mode
@@ -277,6 +307,7 @@ def main() -> None:
         imports = args.imports
         action_type = args.action_type
 
+    # 把收集到的配置统一交给 run_smolagent()，完成真正的模型/工具/agent 创建与运行。
     run_smolagent(
         prompt,
         tools,
@@ -291,4 +322,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # 允许直接通过 `python -m smolagents.cli ...` 或脚本入口启动这个 CLI。
     main()
