@@ -1965,3 +1965,347 @@ CPython 大致是：
 所以它不是简单地“执行 Python 代码”，而是在定义：
 
 **一套可控的、受限的、可持续维护的 Python 运行时模型。**
+
+---
+
+## 29. 整体复盘：把这份文件重新压缩成一张脑图
+
+如果已经逐段读过 `src/smolagents/local_python_executor.py`，最后最重要的不是再背每个函数名，而是把整份文件重新压缩成一个稳定的心智模型。
+
+这一章就是这个“收官版复盘”。
+
+### 29.1 先用一句话说清它到底是什么
+
+这份文件不是“执行 Python 代码的一个小工具”，而是：
+
+**一个基于官方 AST 的、手工定义运行语义的、本地受限 Python 解释器。**
+
+它和直接 `exec(code)` 的本质区别是：
+
+- `exec`：把执行权整体交给 CPython
+- 本文件：先拿到 AST，再自己决定每个节点怎么执行
+
+所以这份文件真正控制的不是“代码字符串”，而是：
+
+**代码字符串被解析成 AST 之后的每一个运行时动作。**
+
+### 29.2 最重要的三层执行链路
+
+读到最后，必须牢牢记住这三层：
+
+1. `LocalPythonExecutor`
+2. `evaluate_python_code(...)`
+3. `evaluate_ast(...)`
+
+三者关系可以概括成：
+
+- `LocalPythonExecutor`：对外门面，维护长期状态与工具环境
+- `evaluate_python_code`：单次代码执行控制器
+- `evaluate_ast`：节点分发中心
+
+可以用下面这张图记住：
+
+```mermaid
+flowchart TD
+    A["LocalPythonExecutor.__call__(code)"] --> B["evaluate_python_code(code, state, tools, imports)"]
+    B --> C["ast.parse(code)"]
+    C --> D["遍历顶层 AST 节点"]
+    D --> E["evaluate_ast(node, ...)"]
+    E --> F["evaluate_xxx(...)"]
+    F --> G["修改 state / 返回值 / 抛控制流异常 / 写日志"]
+    G --> H["CodeOutput(output, logs, is_final_answer)"]
+```
+
+这意味着：
+
+- `LocalPythonExecutor` 不负责节点语义
+- `evaluate_python_code` 不负责每种语法细节
+- `evaluate_ast` 不负责外部状态生命周期
+
+每一层都有明确边界。
+
+### 29.3 运行时模型：解释器到底维护了什么
+
+这份文件的精髓之一，是它没有偷用 Python 自己的完整局部变量模型，而是维护了一套自己的运行时对象模型。
+
+最关键的是：
+
+- `state`
+- `static_tools`
+- `custom_tools`
+- `authorized_imports`
+- `PrintContainer`
+- 控制流异常对象
+
+其中最关键的是 `state`。
+
+`state` 不是普通的临时字典，而是：
+
+**整个解释器的变量环境 / 名字空间 / 跨 step 持久化存储。**
+
+你可以这样理解：
+
+- `x = 1` 最终通常落到 `state["x"] = 1`
+- `import math` 最终通常落到 `state["math"] = safe_math`
+- `class Person: ...` 最终通常落到 `state["Person"] = Person类对象`
+
+而 `static_tools` / `custom_tools` 是解释器额外维护的“可调用对象区”：
+
+- `static_tools`：安全、稳定、不可随便覆盖
+- `custom_tools`：运行时动态定义出来的函数
+
+这也是为什么这个解释器不是直接靠 Python 的 `globals()` / `locals()` 在跑。
+
+### 29.4 这份文件的核心设计模式
+
+如果把这份文件的方法论抽出来，它反复使用的是 4 个模式。
+
+#### 模式 1：递归求子表达式，再组合结果
+
+典型形态：
+
+```python
+left = evaluate_ast(node.left, ...)
+right = evaluate_ast(node.right, ...)
+return left + right
+```
+
+这就是 AST-walking interpreter 最经典的写法。
+
+你在这些函数里都见过它：
+
+- `evaluate_attribute`
+- `evaluate_subscript`
+- `evaluate_binop`
+- `evaluate_condition`
+- `evaluate_call`
+
+#### 模式 2：把“流程控制”与“具体动作”拆开
+
+典型例子：
+
+- `evaluate_assign` 负责赋值流程
+- `set_value(...)` 负责具体往哪里写
+
+还有：
+
+- `evaluate_function_def` 负责注册函数
+- `create_function(...)` 负责真正造函数对象
+
+这说明作者在实现解释器时，明确做了职责拆分，而不是把所有语义堆进一个大函数里。
+
+#### 模式 3：用异常模拟语言级控制流
+
+这份文件里有一组非常关键的内部异常：
+
+- `BreakException`
+- `ContinueException`
+- `ReturnException`
+- `FinalAnswerException`
+
+它们不是错误，而是跳转机制。
+
+也就是说，在这个解释器里：
+
+- `return` 不是直接“函数返回”
+- `break` 不是直接“跳出循环”
+- `final_answer` 不是直接“结束 Agent”
+
+而是：
+
+**先抛异常，再由外层正确位置捕获，从而模拟语言级跳转。**
+
+#### 模式 4：把定义语句变成运行时对象
+
+这是最值得反复复盘的一点。
+
+- `FunctionDef` 不会立刻执行函数体，而是变成闭包函数对象
+- `ClassDef` 不会立刻成为类，而是先组装 `class_dict`，再交给 `metaclass(...)`
+
+也就是：
+
+- `def` -> 闭包函数对象
+- `class` -> 类命名空间 + metaclass 创建
+
+这正是解释器实现里最像“语言内核”的部分。
+
+### 29.5 这份文件到底支持了哪些 Python 语义
+
+如果从语义大类看，这份文件已经覆盖了一个相当完整的 Python 子集：
+
+#### 1. 基础表达式
+
+- 名字解析
+- 属性访问
+- 下标访问
+- 一元运算
+- 二元运算
+- 布尔运算
+- 比较运算
+
+#### 2. 赋值体系
+
+- 普通赋值
+- 注解赋值
+- 增量赋值
+- 解包赋值
+- 属性赋值
+- 下标赋值
+
+#### 3. 调用体系
+
+- 普通函数调用
+- 属性方法调用
+- lambda 调用
+- 调用结果再调用
+- 下标结果调用
+- `*args` / `**kwargs`
+
+#### 4. 定义体系
+
+- 函数定义
+- 类定义
+- 方法
+- 类属性
+- 注解属性
+
+#### 5. 控制流
+
+- `if / elif / else`
+- `for`
+- `while`
+- `try / except / else / finally`
+- `with`
+- `raise`
+- `assert`
+
+#### 6. 复合表达式
+
+- 列表推导式
+- 集合推导式
+- 字典推导式
+- 生成器表达式
+
+#### 7. 运行时配套能力
+
+- `import`
+- `del`
+- `print` 输出收集
+- `final_answer`
+
+所以它绝对不是“只支持几种表达式的 toy demo”，而是一套已经能跑很多真实 LLM 生成代码的受限解释器。
+
+### 29.6 这份文件最关键的安全模型到底是什么
+
+安全不是单点完成的，而是多层叠加的。
+
+可以把它复盘成下面这几层：
+
+```mermaid
+flowchart TD
+    A["代码字符串"] --> B["AST 级语法限制"]
+    B --> C["名字解析限制 / dunder 限制"]
+    C --> D["调用前安全检查"]
+    D --> E["返回值安全检查"]
+    E --> F["import 白名单 + safe_module 包装"]
+    F --> G["输出重定向 + 资源限制 + 超时"]
+```
+
+真正有安全意义的核心层包括：
+
+- import 白名单
+- dunder 限制
+- 危险 builtin 拦截
+- 返回值检查
+- 输出重定向
+- 操作数 / 循环 / 超时限制
+
+其中 `get_safe_module(...)` 的意义要摆正：
+
+- 它有用
+- 但不是强隔离
+- 它更像“模块暴露面整理层”
+
+所以不能把这个文件误解成“完整沙箱”，更准确的说法是：
+
+**它是一套受控执行系统，但不是操作系统级、进程级的物理隔离沙箱。**
+
+### 29.7 这份文件和 CPython 的根本差异
+
+学完之后，这个对比必须能说清。
+
+CPython 的典型路径是：
+
+```text
+源码 -> AST -> 字节码 -> Python 虚拟机执行
+```
+
+而这个文件是：
+
+```text
+源码 -> AST -> 自己递归解释 AST
+```
+
+差异在于：
+
+1. 它不生成字节码
+2. 它不走 Python VM 的默认语义
+3. 它在每个 AST 节点层都可以插入控制逻辑
+4. 它大量借用 Python 自己的对象系统，但不借用默认执行路径
+
+这就是为什么：
+
+- 它很适合“可控执行”
+- 但不适合追求“完整 CPython 兼容性”
+- 也不适合追求极致性能
+
+### 29.8 从学习角度，最该记住的几个“高价值理解”
+
+如果未来你忘掉大量细节，只保留少数关键点，那么最值得记住的是下面这些。
+
+#### 1. AST-walking interpreter 的核心不是 parse，而是语义接管
+
+这个文件没有自己写 parser。  
+真正值钱的是：
+
+**把 AST 变成自己定义的运行时语义。**
+
+#### 2. 函数和类是解释器实现里最像“语言内核”的部分
+
+因为这里不再只是“算个表达式”，而是在自己构造：
+
+- 函数对象
+- 类对象
+- 作用域
+- 方法上下文
+
+#### 3. 安全的关键不是单点，而是层层设防
+
+单独看 `get_safe_module(...)`、单独看 `safer_eval(...)`、单独看 import 白名单，都不够。  
+真正有效的是这些层同时存在。
+
+#### 4. 这类解释器天然适合 LLM 代码执行场景
+
+因为 LLM 代码执行要的不是“完全自由”，而是：
+
+- 足够像 Python
+- 但又能被系统接管
+- 能限制 import
+- 能收集输出
+- 能在必要时中断或终止
+
+这正是 AST-walking interpreter 的强项。
+
+### 29.9 现在如果你要向别人讲这份文件，最短可以怎么讲
+
+可以用下面这段话：
+
+> `local_python_executor.py` 本质上实现了一个基于 Python 官方 AST 的本地受限解释器。它先用 `ast.parse()` 把代码变成语法树，再通过 `evaluate_ast()` 按节点类型分发到 `evaluate_xxx()`，手工实现表达式、赋值、调用、函数、类、控制流、import 等运行语义。同时它维护自己的运行时环境 `state/static_tools/custom_tools`，并通过白名单 import、dunder 限制、危险 builtin 检查、返回值检查、输出重定向和超时等机制，把“可执行 Python”收敛成“可控 Python”。最外层再由 `LocalPythonExecutor` 把这套能力封装成一个可跨 step 持久化使用的执行器对象。  
+
+如果能顺畅讲出这段，基本就说明这份文件已经真正吃透了。
+
+### 29.10 最后一句收官结论
+
+把整份文件重新压缩成一句话：
+
+**它不是在“运行一段 Python 代码”，而是在“实现一套可控的 Python 运行时”。**
