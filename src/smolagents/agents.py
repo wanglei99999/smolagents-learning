@@ -237,6 +237,16 @@ EMPTY_PROMPT_TEMPLATES = PromptTemplates(
 
 @dataclass
 class RunResult:
+    # RunResult 可以理解成“整次 Agent 运行的汇总结果对象”。
+    # 它不是某一步 step 的日志，也不是底层 executor 的 CodeOutput，
+    # 而是 Agent.run(..., return_full_result=True) 时返回给调用方的高层结果快照。
+    #
+    # 里面会同时放：
+    # - output: 最终答案
+    # - state: 这次 run 的收尾状态（成功 / 达到最大步数）
+    # - steps: 整次运行过程积累下来的 memory steps
+    # - token_usage: 整次 run 的 token 统计
+    # - timing: 整次 run 的时间统计
     """Holds extended information about an agent run.
 
     Attributes:
@@ -313,6 +323,18 @@ StreamEvent: TypeAlias = Union[
 
 
 class MultiStepAgent(ABC):
+    # MultiStepAgent 是整个 Agent 体系的“骨架基类”。
+    # 可以把它理解成：
+    #   - ReAct 多步循环的通用框架
+    #   - memory / monitor / logger / tools / managed_agents 的总组织者
+    #   - CodeAgent / ToolCallingAgent 这类具体 Agent 的共同父类
+    #
+    # 它本身不决定“动作到底长什么样”：
+    #   - CodeAgent: 动作是 Python 代码
+    #   - ToolCallingAgent: 动作是结构化工具调用
+    #
+    # 但它负责定义这类 Agent 的共同运行模式：
+    #   任务输入 -> 多轮 step 循环 -> 每轮思考/行动/观察 -> memory 累积 -> 最终答案
     """
     Agent class that solves the given task step by step, using the ReAct framework:
     While the objective is not reached, the agent will perform a cycle of action (given by the LLM) and observation (obtained from the environment).
